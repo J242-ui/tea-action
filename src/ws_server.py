@@ -1,0 +1,173 @@
+"""茶园智能执行 WebSocket 状态服务（零新依赖：uvicorn + websockets 手写 ASGI）。
+
+职责（演示链路的后半段）：
+  Agent 决策 → 执行器状态 → WebSocket 推送 → 网页动态展示
+
+- REST（http 同端口）：
+  GET  /                网页（web/index.html）
+  GET  /api/status      服务与 Agent 状态、最近状态快照
+  POST /api/agent/start 启动 Agent 主循环
+  POST /api/agent/stop  停止 Agent
+  POST /api/agent/step  手动触发一轮决策
+  GET  /api/history     决策历史（agent_decision_log）
+  GET  /api/health      健康检查
+- WS  /ws               实时推送 state_update 事件
+
+运行：python -m src.ws_server   （默认 127.0.0.1:8510）
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+from pathlib import Path
+
+from . import db
+from .agent.runner import runner
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+WEB_INDEX = BASE_DIR / "web" / "index.html"
+
+SERVER_HOST = os.getenv("AGENT_WS_HOST", "127.0.0.1")
+SERVER_PORT = int(os.getenv("AGENT_WS_PORT", "8510"))
+
+
+def _json_body(data: dict, status: int = 200) -> bytes:
+    return json.dumps(data, ensure_ascii=False, default=str).encode("utf-8")
+
+
+class TeaAgentASGI:
+    """手写 ASGI 应用：HTTP REST + WebSocket 推送，无框架依赖。"""
+
+    def __init__(self):
+        self.clients: list = []
+        self.loop: asyncio.AbstractEventLoop | None = None
+
+    # ---------- ASGI 入口 ----------
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "lifespan":
+            await self._lifespan(receive, send)
+        elif scope["type"] == "http":
+            await self._http(scope, receive, send)
+        elif scope["type"] == "websocket":
+            await self._websocket(scope, receive, send)
+
+    async def _lifespan(self, receive, send):
+        while True:
+            msg = await receive()
+            if msg["type"] == "lifespan.startup":
+                self.loop = asyncio.get_running_loop()
+                runner.subscribe(self._broadcast)
+                await send({"type": "lifespan.startup.complete"})
+            elif msg["type"] == "lifespan.shutdown":
+                runner.stop()
+                await send({"type": "lifespan.shutdown.complete"})
+                return
+
+    # ---------- 跨线程广播 ----------
+    def _broadcast(self, event: dict) -> None:
+        """runner 后台线程 → uvicorn 事件循环 → 所有 WS 客户端。"""
+        if self.loop is None or not self.clients:
+            return
+        payload = json.dumps(event, ensure_ascii=False, default=str)
+
+        async def _send_all():
+            for ws in list(self.clients):
+                try:
+                    await ws["send"]({"type": "websocket.send", "text": payload})
+                except Exception:  # noqa: BLE001
+                    try:
+                        self.clients.remove(ws)
+                    except ValueError:
+                        pass
+
+        try:
+            asyncio.run_coroutine_threadsafe(_send_all(), self.loop)
+        except Exception:  # noqa: BLE001
+            pass
+
+    # ---------- HTTP ----------
+    async def _http(self, scope, receive, send):
+        path = scope["path"]
+        method = scope.get("method", "GET")
+        status = 200
+        ctype = "application/json; charset=utf-8"
+        body = b'{"ok":false,"message":"not found"}'
+
+        try:
+            if method == "GET" and path in ("/", "/index.html"):
+                ctype = "text/html; charset=utf-8"
+                body = WEB_INDEX.read_bytes()
+            elif method == "GET" and path == "/api/health":
+                body = _json_body({"ok": True, "service": "tea-agent-ws"})
+            elif method == "GET" and path == "/api/status":
+                body = _json_body({
+                    "running": runner.running,
+                    "steps": runner.steps,
+                    "interval": runner.interval,
+                    "garden_key": runner.garden_key,
+                    "latest": runner.latest,
+                })
+            elif method == "GET" and path == "/api/history":
+                body = _json_body({"items": db.agent_decision_history(runner.garden_key, limit=20)})
+            elif method == "POST" and path == "/api/agent/start":
+                body = _json_body({"ok": runner.start(), "running": runner.running})
+            elif method == "POST" and path == "/api/agent/stop":
+                body = _json_body({"ok": runner.stop(), "running": runner.running})
+            elif method == "POST" and path == "/api/agent/step":
+                snapshot = runner.step()
+                body = _json_body({"ok": True, "snapshot": snapshot})
+            else:
+                status = 404
+                body = _json_body({"ok": False, "message": "not found"}, 404)
+        except Exception as e:  # noqa: BLE001
+            status = 500
+            body = _json_body({"ok": False, "message": str(e)}, 500)
+
+        await send({"type": "http.response.start",
+                    "status": status,
+                    "headers": [(b"content-type", ctype.encode()),
+                                (b"content-length", str(len(body)).encode()),
+                                (b"cache-control", b"no-store")]})
+        await send({"type": "http.response.body", "body": body})
+
+    # ---------- WebSocket ----------
+    async def _websocket(self, scope, receive, send):
+        await send({"type": "websocket.accept"})
+        conn = {"send": send}
+        self.clients.append(conn)
+        try:
+            if runner.latest:
+                await send({"type": "websocket.send",
+                            "text": json.dumps({"kind": "state_update", "data": runner.latest},
+                                               ensure_ascii=False, default=str)})
+            while True:
+                msg = await receive()
+                if msg["type"] == "websocket.disconnect":
+                    break
+                # 客户端心跳消息：目前仅用于保活
+        except Exception:  # noqa: BLE001
+            pass
+        finally:
+            try:
+                self.clients.remove(conn)
+            except ValueError:
+                pass
+
+
+app = TeaAgentASGI()
+
+
+def main() -> None:
+    import uvicorn
+    print("=" * 56)
+    print("  茶园智能执行服务（Tea Garden Agent WS）")
+    print(f"  动态展示网页 : http://{SERVER_HOST}:{SERVER_PORT}/")
+    print(f"  WebSocket   : ws://{SERVER_HOST}:{SERVER_PORT}/ws")
+    print(f"  状态API     : http://{SERVER_HOST}:{SERVER_PORT}/api/status")
+    print("=" * 56)
+    uvicorn.run(app, host=SERVER_HOST, port=SERVER_PORT, log_level="info")
+
+
+if __name__ == "__main__":
+    main()

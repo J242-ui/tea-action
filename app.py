@@ -34,6 +34,7 @@ pages = [
     st.Page("pages/3_智能问答.py", title="智能问答", icon="🤖"),
     st.Page("pages/4_农事建议.py", title="农事建议", icon="🌾"),
     st.Page("pages/5_我的茶园.py", title="我的茶园", icon="👤"),
+    st.Page("pages/6_智能执行.py", title="智能执行", icon="🤖"),
 ]
 
 # 开发者模式：条件显示开发者控制台（无需薄壳文件）

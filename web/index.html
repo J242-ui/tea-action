@@ -1,0 +1,377 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>茶园智能执行 · 动态展示</title>
+<style>
+  :root {
+    --bg: #0f2418;
+    --card: #162e20;
+    --card2: #1c3a28;
+    --line: #2c5440;
+    --text: #e8f2ea;
+    --dim: #9db8a8;
+    --green: #3ecf7a;
+    --amber: #f0b429;
+    --red: #e5533d;
+    --blue: #4aa8ff;
+    --cyan: #38d6c4;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: "Microsoft YaHei", "PingFang SC", system-ui, sans-serif;
+    background: radial-gradient(1200px 600px at 20% -10%, #1d4030 0%, var(--bg) 55%);
+    color: var(--text);
+    min-height: 100vh;
+    padding: 18px 22px 40px;
+  }
+  header { display: flex; align-items: center; gap: 14px; margin-bottom: 18px; flex-wrap: wrap; }
+  header h1 { font-size: 22px; letter-spacing: 1px; }
+  header .sub { color: var(--dim); font-size: 13px; }
+  .status-pill {
+    display: inline-flex; align-items: center; gap: 7px;
+    padding: 5px 14px; border-radius: 999px; font-size: 13px; font-weight: 600;
+    border: 1px solid var(--line); background: var(--card);
+  }
+  .status-pill .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--dim); }
+  .status-pill.running .dot { background: var(--green); box-shadow: 0 0 10px var(--green); }
+  .status-pill.stopped .dot { background: var(--dim); }
+  .status-pill.error .dot { background: var(--red); }
+  .grid {
+    display: grid; gap: 16px;
+    grid-template-columns: minmax(300px, 1.25fr) minmax(260px, 1fr) minmax(300px, 1fr);
+  }
+  .card {
+    background: linear-gradient(180deg, var(--card) 0%, var(--card2) 100%);
+    border: 1px solid var(--line); border-radius: 14px; padding: 14px 16px;
+  }
+  .card h2 { font-size: 14px; color: var(--dim); font-weight: 600; margin-bottom: 10px; display:flex; align-items:center; gap:8px;}
+  .card h2 .tag { margin-left: auto; font-size: 11px; padding: 2px 8px; border-radius: 8px; background: var(--card2); border:1px solid var(--line); color: var(--dim);}
+  /* ---- 摄像头 ---- */
+  .camera-wrap { position: relative; border-radius: 10px; overflow: hidden; background:#000; border:1px solid var(--line);}
+  .camera-wrap img { width: 100%; display: block; min-height: 220px; object-fit: cover; }
+  .cam-badge { position: absolute; top: 8px; left: 8px; font-size: 11px; padding: 3px 9px; border-radius: 8px; background: rgba(0,0,0,.6); color: var(--cyan); }
+  .det-list { margin-top: 10px; display: flex; flex-wrap: wrap; gap: 6px; }
+  .det { font-size: 11px; padding: 3px 9px; border-radius: 999px; border: 1px solid var(--line); background: var(--card2); }
+  .det.disease { border-color: var(--red); color: #ffb3a6; }
+  .det.healthy { border-color: var(--green); color: #a8f0c5; }
+  .summary-line { margin-top: 8px; font-size: 12px; color: var(--dim); }
+  /* ---- 土壤仪表 ---- */
+  .gauge-wrap { display: flex; align-items: center; gap: 14px; }
+  .gauge-val { font-size: 40px; font-weight: 700; line-height: 1; }
+  .gauge-val small { font-size: 14px; color: var(--dim); font-weight: 400; }
+  .gauge-status { margin-top: 6px; font-size: 13px; font-weight: 600; }
+  .soil-bar { margin-top: 12px; height: 10px; border-radius: 6px; background: var(--card2); border:1px solid var(--line); position: relative; overflow: hidden;}
+  .soil-bar .fill { height: 100%; border-radius: 6px; transition: width .6s ease, background .6s ease; }
+  .soil-marks { display: flex; justify-content: space-between; font-size: 10px; color: var(--dim); margin-top: 4px; }
+  /* ---- 决策面板 ---- */
+  .decision-type { font-size: 20px; font-weight: 700; margin: 2px 0 8px; }
+  .decision-summary { font-size: 12px; color: var(--dim); line-height: 1.6; }
+  .decision-explain { margin-top: 10px; padding: 10px 12px; border-radius: 10px;
+    background: linear-gradient(135deg, rgba(96,200,140,.14), rgba(64,150,110,.10));
+    border: 1px solid rgba(96,200,140,.35); font-size: 13px; line-height: 1.7; color: var(--text); }
+  .action-item {
+    margin-top: 8px; padding: 8px 10px; border-radius: 9px; font-size: 12px;
+    background: var(--card2); border: 1px solid var(--line); line-height: 1.5;
+  }
+  .action-item b { color: var(--cyan); }
+  .empty { color: var(--dim); font-size: 12px; }
+  /* ---- 执行器 ---- */
+  .act-row { display:flex; align-items:center; gap:14px; padding: 10px 0; border-bottom:1px dashed var(--line); }
+  .act-row:last-child { border-bottom: none; }
+  .act-icon { width: 66px; height: 66px; flex: 0 0 66px; }
+  .act-name { font-size: 14px; font-weight: 600; }
+  .act-state { font-size: 12px; margin-top: 3px; }
+  .act-state.open, .act-state.on { color: var(--cyan); }
+  .act-state.closed, .act-state.off { color: var(--dim); }
+  .act-meta { font-size: 11px; color: var(--dim); margin-top: 3px; }
+  /* 流水动画 */
+  .flow { animation: dashmove 1.2s linear infinite; }
+  @keyframes dashmove { to { stroke-dashoffset: -24; } }
+  /* 喷雾动画 */
+  .drop { animation: spray 1.4s ease-out infinite; opacity: 0; }
+  @keyframes spray {
+    0% { opacity: .9; transform: translate(0,0) scale(1); }
+    100% { opacity: 0; transform: translate(var(--dx, 18px), var(--dy, -22px)) scale(1.6); }
+  }
+  .boom-swing { animation: swing 3s ease-in-out infinite alternate; transform-origin: 50% 8%; }
+  @keyframes swing { from { transform: rotate(-1.5deg); } to { transform: rotate(1.5deg); } }
+  .valve-open-anim { animation: valvestroke .4s ease; }
+  @keyframes valvestroke { 0% { transform: scaleY(1);} 50% { transform: scaleY(1.25);} 100% { transform: scaleY(1);} }
+  footer { margin-top: 18px; color: var(--dim); font-size: 12px; text-align: center; }
+  @media (max-width: 1100px) { .grid { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>🍵 茶园智能执行 · 实时状态</h1>
+  <span class="sub">USB摄像头 → YOLO推理 → Agent决策 → WebSocket推送 → 动态展示</span>
+  <span id="agentPill" class="status-pill stopped"><span class="dot"></span><span id="agentPillText">服务未连接</span></span>
+  <span id="stepPill" class="status-pill"><span class="dot"></span>决策轮次 <b id="steps">0</b></span>
+  <span id="camPill" class="status-pill"><span class="dot"></span><span id="camPillText">摄像头…</span></span>
+</header>
+
+<div class="grid">
+  <!-- 左：摄像头 + 检测 -->
+  <section class="card">
+    <h2>📷 视觉检测 <span class="tag" id="modelTag">模型加载中…</span></h2>
+    <div class="camera-wrap">
+      <img id="camImg" alt="摄像头画面" src="">
+      <span class="cam-badge" id="camBadge">演示帧</span>
+    </div>
+    <div class="det-list" id="detList"></div>
+    <div class="summary-line" id="detSummary">等待 Agent 推送…</div>
+  </section>
+
+  <!-- 中：土壤湿度 + 决策 -->
+  <section class="card">
+    <h2>🌱 土壤湿度传感器</h2>
+    <div class="gauge-wrap">
+      <svg width="96" height="96" viewBox="0 0 100 100">
+        <circle cx="50" cy="50" r="40" fill="none" stroke="#24402f" stroke-width="9" stroke-linecap="round"/>
+        <circle id="gaugeArc" cx="50" cy="50" r="40" fill="none" stroke="#3ecf7a" stroke-width="9"
+                stroke-linecap="round" stroke-dasharray="251.2" stroke-dashoffset="251.2"
+                transform="rotate(-90 50 50)"/>
+        <text x="50" y="52" text-anchor="middle" font-size="18" font-weight="700" fill="#e8f2ea"
+              id="gaugeText">--</text>
+      </svg>
+      <div>
+        <div class="gauge-val" id="soilVal">--<small> %</small></div>
+        <div class="gauge-status" id="soilStatus">等待数据…</div>
+      </div>
+    </div>
+    <div class="soil-bar"><div class="fill" id="soilBar" style="width:0%"></div></div>
+    <div class="soil-marks"><span>0</span><span>45 缺水</span><span>60~80 适宜</span><span>100%</span></div>
+
+    <h2 style="margin-top:16px">🤖 Agent 决策</h2>
+    <div id="decisionType" class="decision-type">--</div>
+    <div id="decisionSummary" class="decision-summary">等待决策…</div>
+    <div id="decisionExplain" class="decision-explain" style="display:none"></div>
+    <div id="actionList"></div>
+  </section>
+
+  <!-- 右：执行器 -->
+  <section class="card">
+    <h2>⚙️ 执行器状态</h2>
+
+    <!-- 滴灌阀门 -->
+    <div class="act-row">
+      <div class="act-icon">
+        <svg viewBox="0 0 120 120" width="66" height="66">
+          <!-- 主管道 -->
+          <line x1="8" y1="30" x2="112" y2="30" stroke="#5c7a68" stroke-width="10" stroke-linecap="round"/>
+          <!-- 水源 -->
+          <circle cx="14" cy="30" r="7" fill="#38d6c4"/>
+          <!-- 阀门主体 -->
+          <rect x="52" y="16" width="16" height="28" rx="4" fill="#3a5a48" stroke="#6d9379" stroke-width="2"/>
+          <!-- 阀门手柄 -->
+          <line id="valveHandle" x1="60" y1="30" x2="88" y2="14" stroke="#f0b429" stroke-width="5" stroke-linecap="round"/>
+          <!-- 滴灌支管 -->
+          <path id="dripPipe" d="M60 30 L60 78" stroke="#4a7a5e" stroke-width="5" fill="none" stroke-dasharray="6 6" class="flow" style="opacity:.25"/>
+          <!-- 滴头 -->
+          <circle id="dripHead" cx="60" cy="84" r="5" fill="#38d6c4"/>
+          <!-- 水滴 -->
+          <g id="drops" style="opacity:0">
+            <circle class="drop" cx="60" cy="90" r="3" fill="#38d6c4" style="--dx:-10px; --dy:26px; animation-delay:0s"/>
+            <circle class="drop" cx="60" cy="90" r="3" fill="#38d6c4" style="--dx:8px; --dy:30px; animation-delay:.35s"/>
+            <circle class="drop" cx="60" cy="90" r="2.5" fill="#38d6c4" style="--dx:-2px; --dy:34px; animation-delay:.7s"/>
+          </g>
+        </svg>
+      </div>
+      <div style="flex:1">
+        <div class="act-name">💧 滴灌阀门 <span id="valveState" class="act-state closed" style="display:inline">closed</span></div>
+        <div class="act-meta" id="valveMeta">流量 0 L/h · 未运行</div>
+      </div>
+    </div>
+
+    <!-- 喷杆喷头 -->
+    <div class="act-row">
+      <div class="act-icon">
+        <svg viewBox="0 0 120 120" width="66" height="66">
+          <!-- 立柱 -->
+          <line x1="60" y1="112" x2="60" y2="52" stroke="#5c7a68" stroke-width="7" stroke-linecap="round"/>
+          <!-- 喷杆横梁 -->
+          <g id="boomGroup">
+            <line x1="18" y1="42" x2="102" y2="42" stroke="#6d9379" stroke-width="6" stroke-linecap="round"/>
+            <!-- 喷头 -->
+            <circle cx="30" cy="42" r="6" fill="#3a5a48" stroke="#6d9379" stroke-width="2"/>
+            <circle cx="60" cy="42" r="6" fill="#3a5a48" stroke="#6d9379" stroke-width="2"/>
+            <circle cx="90" cy="42" r="6" fill="#3a5a48" stroke="#6d9379" stroke-width="2"/>
+            <!-- 喷雾 -->
+            <g id="sprayGroup" style="opacity:0">
+              <circle class="drop" cx="30" cy="42" r="3" fill="#bfe9ff" style="--dx:-16px; --dy:-24px; animation-delay:0s"/>
+              <circle class="drop" cx="30" cy="42" r="3" fill="#bfe9ff" style="--dx:14px; --dy:-26px; animation-delay:.2s"/>
+              <circle class="drop" cx="60" cy="42" r="3" fill="#bfe9ff" style="--dx:0px; --dy:-28px; animation-delay:.4s"/>
+              <circle class="drop" cx="60" cy="42" r="3" fill="#bfe9ff" style="--dx:-12px; --dy:-22px; animation-delay:.1s"/>
+              <circle class="drop" cx="90" cy="42" r="3" fill="#bfe9ff" style="--dx:18px; --dy:-26px; animation-delay:.3s"/>
+              <circle class="drop" cx="90" cy="42" r="3" fill="#bfe9ff" style="--dx:-6px; --dy:-24px; animation-delay:.5s"/>
+            </g>
+          </g>
+        </svg>
+      </div>
+      <div style="flex:1">
+        <div class="act-name">🚿 喷杆喷头 <span id="boomState" class="act-state off" style="display:inline">off</span></div>
+        <div class="act-meta" id="boomMeta">压力 0 bar · 未作业</div>
+      </div>
+    </div>
+
+    <div style="margin-top:10px; font-size:11px; color:var(--dim); line-height:1.6" id="eventLog">
+      最近事件：等待中…
+    </div>
+  </section>
+</div>
+
+<footer>茶园智能执行演示 · WebSocket 实时推送 · 全部软件模拟（摄像头可真实接入）</footer>
+
+<script>
+const DECISION_CN = {
+  irrigate: "💧 自动浇水", irrigating: "💧 灌溉中", spray: "🚿 自动打药", cool: "❄️ 降温喷灌",
+  stop: "⏹ 停止作业", noop: "✔ 无操作（观察中）"
+};
+const $ = id => document.getElementById(id);
+
+function soilStyle(v, valveOpen) {
+  if (v === null || v === undefined) return { color: "var(--dim)", label: "等待数据", bar: "var(--dim)" };
+  if (valveOpen) return { color: "var(--blue)", label: "💧 灌溉中 · 湿度回升中", bar: "var(--blue)" };
+  if (v < 45)  return { color: "var(--red)",   label: "⚠ 缺水 · 触发灌溉", bar: "var(--red)" };
+  if (v < 60)  return { color: "var(--amber)", label: "偏干 · 注意保墒",   bar: "var(--amber)" };
+  if (v <= 80) return { color: "var(--green)", label: "✓ 适宜",            bar: "var(--green)" };
+  return { color: "var(--blue)", label: "过湿 · 停止灌溉", bar: "var(--blue)" };
+}
+
+function render(s) {
+  // Agent 状态
+  const pill = $("agentPill");
+  pill.className = "status-pill " + (s.running ? "running" : "stopped");
+  $("agentPillText").textContent = s.running ? "Agent 运行中" : "Agent 已停止";
+  $("steps").textContent = s.steps || 0;
+
+  // 摄像头
+  $("camPillText").textContent = s.camera && s.camera.available ? "USB摄像头" : "演示帧";
+  $("modelTag").textContent = (s.detections && s.detections.backend === "ultralytics")
+    ? "YOLO 模型" : "模拟检测(降级)";
+  if (s.detections && s.detections.image) {
+    $("camImg").src = s.detections.image;
+    $("camBadge").textContent = (s.detections.source === "usb_cam") ? "USB摄像头" : "演示帧";
+  }
+  // 检测列表
+  const detList = $("detList");
+  detList.innerHTML = "";
+  const dts = (s.detections && s.detections.detections) || [];
+  dts.forEach(d => {
+    const el = document.createElement("span");
+    el.className = "det " + (d["class"] === "Healthy" ? "healthy" : "disease");
+    el.textContent = `${d["class"]} ${(d.conf * 100).toFixed(0)}%`;
+    detList.appendChild(el);
+  });
+  const sm = (s.detections && s.detections.summary) || {};
+  $("detSummary").textContent = sm.total !== undefined
+    ? `共检出 ${sm.total} 处 · ${sm.diseases && sm.diseases.length ? "病害: " + sm.diseases.join("、") : "无病害"}`
+    : "等待检测…";
+
+  // 土壤湿度
+  const soilV = s.soil ? s.soil.value : null;
+  const valveOpen = (s.actuator && s.actuator.drip_valve && s.actuator.drip_valve.state === "open");
+  const st = soilStyle(soilV, valveOpen);
+  $("soilVal").innerHTML = (soilV !== null ? soilV.toFixed(1) : "--") + "<small> %</small>";
+  $("soilStatus").textContent = st.label;
+  $("soilStatus").style.color = st.color;
+  const arc = $("gaugeArc");
+  const pct = soilV !== null ? Math.min(100, Math.max(0, soilV)) : 0;
+  arc.style.strokeDashoffset = String(251.2 * (1 - pct / 100));
+  arc.style.stroke = st.bar;
+  $("soilBar").style.width = pct + "%";
+  $("soilBar").style.background = st.bar;
+
+  // 决策
+  const dec = s.decision || {};
+  $("decisionType").textContent = DECISION_CN[dec.decision_type] || dec.decision_type || "--";
+  $("decisionType").style.color = dec.overall_level === "high" ? "var(--red)"
+    : dec.overall_level === "medium" ? "var(--amber)" : "var(--green)";
+  $("decisionSummary").textContent = dec.summary || "等待决策…";
+  const exp = dec.explanation || "";
+  const expEl = $("decisionExplain");
+  if (exp) {
+    expEl.style.display = "block";
+    expEl.textContent = "🧠 " + exp;
+  } else {
+    expEl.style.display = "none";
+  }
+  const al = $("actionList");
+  al.innerHTML = "";
+  (dec.actions || []).forEach(a => {
+    const el = document.createElement("div");
+    el.className = "action-item";
+    const dev = a.device === "drip_valve" ? "滴灌阀门" : "喷杆喷头";
+    const op = a.op === "open" || a.op === "on" ? "开启" : "关闭";
+    el.innerHTML = `<b>${dev} → ${op}</b>${a.duration_min ? `（约 ${a.duration_min} 分钟）` : ""}<br>${a.reason || ""}`;
+    al.appendChild(el);
+  });
+  if (!(dec.actions || []).length) {
+    al.innerHTML = `<div class="empty">当前无执行指令（系统保持观察）</div>`;
+  }
+
+  // 执行器
+  const act = s.actuator || {};
+  renderValve(act.drip_valve || {});
+  renderBoom(act.spray_boom || {});
+  if (s.events && s.events.length) {
+    const ev = s.events[s.events.length - 1];
+    const dev = ev.device === "drip_valve" ? "滴灌阀门" : "喷杆喷头";
+    $("eventLog").textContent = `最近事件：${dev} ${ev.operation} · ${ev.reason || ""} @ ${(ev.ts || "").slice(11,19)}`;
+  }
+}
+
+function renderValve(v) {
+  const open = v.state === "open";
+  $("valveState").textContent = open ? "open · 灌溉中" : "closed";
+  $("valveState").className = "act-state " + (open ? "open" : "closed");
+  $("valveMeta").textContent = open
+    ? `流量 ${(v.flow_rate || 0).toFixed(0)} L/h${v.duration_min ? ` · 计划 ${v.duration_min} 分钟` : ""}`
+    : "流量 0 L/h · 未运行";
+  // 手柄：开=垂直向下（水流通过），关=斜向上
+  $("valveHandle").setAttribute("y2", open ? "30" : "14");
+  $("dripPipe").style.opacity = open ? "1" : ".25";
+  $("drops").style.opacity = open ? "1" : "0";
+  $("dripHead").style.opacity = open ? "1" : ".4";
+}
+
+function renderBoom(b) {
+  const on = b.state === "on";
+  $("boomState").textContent = on ? "on · 喷雾中" : "off";
+  $("boomState").className = "act-state " + (on ? "on" : "off");
+  $("boomMeta").textContent = on
+    ? `压力 ${(b.nozzle_pressure || 0).toFixed(1)} bar${b.duration_min ? ` · 计划 ${b.duration_min} 分钟` : ""}`
+    : "压力 0 bar · 未作业";
+  $("sprayGroup").style.opacity = on ? "1" : "0";
+  $("boomGroup").classList.toggle("boom-swing", on);
+}
+
+// ---- WebSocket 连接 ----
+let ws = null;
+function connect() {
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  ws = new WebSocket(`${proto}://${location.host}/ws`);
+  ws.onopen = () => { $("agentPill").className = "status-pill running"; $("agentPillText").textContent = "已连接"; };
+  ws.onmessage = e => {
+    try {
+      const msg = JSON.parse(e.data);
+      if (msg.kind === "state_update") render(msg.data);
+      if (msg.kind === "agent_error") {
+        $("agentPill").className = "status-pill error";
+        $("agentPillText").textContent = "Agent 异常";
+      }
+    } catch (err) { console.warn("解析失败", err); }
+  };
+  ws.onclose = () => {
+    $("agentPill").className = "status-pill stopped";
+    $("agentPillText").textContent = "连接断开，重连中…";
+    setTimeout(connect, 2500);
+  };
+  ws.onerror = () => ws.close();
+}
+connect();
+</script>
+</body>
+</html>

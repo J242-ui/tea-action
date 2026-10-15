@@ -23,8 +23,31 @@ def get_qianfan_api_key() -> str:
     return os.getenv("QIANFAN_API_KEY", "").strip()
 
 
+def get_qianfan_base_url() -> str:
+    """大模型 OpenAI 兼容接口地址。
+
+    默认百度千帆 v2（配合 ernie-4.0-8k 等文心模型）；
+    使用 DeepSeek 等其它 OpenAI 兼容服务时在 .env 覆盖为对应地址。
+    """
+    return os.getenv("QIANFAN_BASE_URL", "https://qianfan.baidubce.com/v2").strip()
+
+
 def get_qianfan_model() -> str:
     return os.getenv("QIANFAN_MODEL", "ernie-4.0-8k").strip()
+
+
+def get_qwen_api_key() -> str:
+    """通义千问（DashScope）API Key：驱动「智能执行 Agent」的决策判断。"""
+    return os.getenv("QWEN_API_KEY", "").strip()
+
+
+def get_qwen_base_url() -> str:
+    """千问 OpenAI 兼容接口地址（阿里云百炼 DashScope）。"""
+    return os.getenv("QWEN_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1").strip()
+
+
+def get_qwen_model() -> str:
+    return os.getenv("QWEN_MODEL", "qwen-plus").strip()
 
 
 def is_demo_mode() -> bool:

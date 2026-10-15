@@ -428,6 +428,41 @@ CREATE TABLE IF NOT EXISTS model_eval_log (
     KEY idx_eval_garden (garden_key),
     KEY idx_eval_created (created_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS sensor_log (
+    id          BIGINT AUTO_INCREMENT PRIMARY KEY,
+    garden_key  VARCHAR(64)  NOT NULL,
+    sensor_type VARCHAR(32)  NOT NULL,
+    value       DOUBLE       NOT NULL,
+    unit        VARCHAR(16)  DEFAULT '%',
+    meta_json   VARCHAR(500) DEFAULT NULL,
+    created_at  DATETIME     DEFAULT CURRENT_TIMESTAMP,
+    KEY idx_sensor (garden_key, sensor_type, created_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS actuator_log (
+    id           BIGINT AUTO_INCREMENT PRIMARY KEY,
+    garden_key   VARCHAR(64)  NOT NULL,
+    device       VARCHAR(32)  NOT NULL,
+    operation    VARCHAR(16)  NOT NULL,
+    duration_min DOUBLE       DEFAULT NULL,
+    reason       VARCHAR(500) DEFAULT NULL,
+    state_json   VARCHAR(500) DEFAULT NULL,
+    created_at   DATETIME     DEFAULT CURRENT_TIMESTAMP,
+    KEY idx_actuator (garden_key, device, created_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS agent_decision_log (
+    id            BIGINT AUTO_INCREMENT PRIMARY KEY,
+    garden_key    VARCHAR(64)  NOT NULL,
+    decision_type VARCHAR(32)  NOT NULL,
+    summary       VARCHAR(600) DEFAULT NULL,
+    inputs_json   MEDIUMTEXT,
+    actions_json  MEDIUMTEXT,
+    overall_level VARCHAR(16)  DEFAULT 'low',
+    created_at    DATETIME     DEFAULT CURRENT_TIMESTAMP,
+    KEY idx_decision (garden_key, created_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 """
     conn = connect()
     try:
@@ -596,3 +631,145 @@ def eval_log_history(limit: int = 50) -> list[dict]:
             return [dict(r) for r in cur.fetchall()]
     finally:
         conn.close()
+
+
+# ===========================================================================
+# 智能执行 Agent · 数据层（阶段 2）
+# ---------------------------------------------------------------------------
+# sensor_log        : 土壤湿度等传感器读数归档
+# actuator_log      : 滴灌阀门/喷杆喷头等执行器动作日志
+# agent_decision_log: Agent 每次融合决策的输入与动作快照
+# 全部 try/except 降级：数据库不可用时仅打印告警，不影响 Agent 主流程。
+# ===========================================================================
+
+def log_sensor(garden_key: str, sensor_type: str, value: float,
+               unit: str = "%", meta: dict | None = None) -> None:
+    try:
+        conn = connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO sensor_log (garden_key,sensor_type,value,unit,meta_json) "
+                    "VALUES (%s,%s,%s,%s,%s)",
+                    (garden_key, sensor_type, float(value), unit,
+                     json.dumps(meta, ensure_ascii=False, default=str) if meta else None),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as e:  # noqa: BLE001
+        print(f"[db] log_sensor 失败: {e}")
+
+
+def recent_sensor(garden_key: str, sensor_type: str = "soil_moisture",
+                  limit: int = 50) -> list[dict]:
+    """返回某茶园某传感器最近的读数（时间升序）。"""
+    try:
+        conn = connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT value,unit,created_at FROM sensor_log "
+                    "WHERE garden_key=%s AND sensor_type=%s "
+                    "ORDER BY id DESC LIMIT %s",
+                    (garden_key, sensor_type, limit),
+                )
+                rows = [dict(r) for r in cur.fetchall()]
+            rows.reverse()
+            return rows
+        finally:
+            conn.close()
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def log_actuator(garden_key: str, device: str, operation: str,
+                 duration_min: float | None = None, reason: str | None = None,
+                 state: dict | None = None) -> None:
+    try:
+        conn = connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO actuator_log (garden_key,device,operation,duration_min,reason,state_json) "
+                    "VALUES (%s,%s,%s,%s,%s,%s)",
+                    (garden_key, device, operation, duration_min, reason,
+                     json.dumps(state, ensure_ascii=False, default=str) if state else None),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as e:  # noqa: BLE001
+        print(f"[db] log_actuator 失败: {e}")
+
+
+def actuator_history(garden_key: str, device: str | None = None, limit: int = 50) -> list[dict]:
+    try:
+        conn = connect()
+        try:
+            with conn.cursor() as cur:
+                if device:
+                    cur.execute(
+                        "SELECT device,operation,duration_min,reason,created_at FROM actuator_log "
+                        "WHERE garden_key=%s AND device=%s ORDER BY id DESC LIMIT %s",
+                        (garden_key, device, limit),
+                    )
+                else:
+                    cur.execute(
+                        "SELECT device,operation,duration_min,reason,created_at FROM actuator_log "
+                        "WHERE garden_key=%s ORDER BY id DESC LIMIT %s",
+                        (garden_key, limit),
+                    )
+                return [dict(r) for r in cur.fetchall()]
+        finally:
+            conn.close()
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def log_agent_decision(garden_key: str, decision_type: str, summary: str | None,
+                       inputs: dict | None = None, actions: list | None = None,
+                       overall_level: str = "low") -> None:
+    try:
+        conn = connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO agent_decision_log "
+                    "(garden_key,decision_type,summary,inputs_json,actions_json,overall_level) "
+                    "VALUES (%s,%s,%s,%s,%s,%s)",
+                    (garden_key, decision_type, summary,
+                     json.dumps(inputs, ensure_ascii=False, default=str) if inputs else None,
+                     json.dumps(actions, ensure_ascii=False, default=str) if actions else None,
+                     overall_level),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as e:  # noqa: BLE001
+        print(f"[db] log_agent_decision 失败: {e}")
+
+
+def agent_decision_history(garden_key: str, limit: int = 30) -> list[dict]:
+    """按时间倒序返回 Agent 决策记录，inputs/actions 已解析为 dict。"""
+    try:
+        conn = connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT decision_type,summary,inputs_json,actions_json,overall_level,created_at "
+                    "FROM agent_decision_log WHERE garden_key=%s ORDER BY id DESC LIMIT %s",
+                    (garden_key, limit),
+                )
+                rows = [dict(r) for r in cur.fetchall()]
+            for r in rows:
+                for k, jk in (("inputs_json", "inputs"), ("actions_json", "actions")):
+                    try:
+                        r[k] = json.loads(r.get(jk) or "null")
+                    except Exception:  # noqa: BLE001
+                        r[k] = None
+            return rows
+        finally:
+            conn.close()
+    except Exception:  # noqa: BLE001
+        return []

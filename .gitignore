@@ -27,3 +27,17 @@ gitignore.txt
 
 # 运行日志
 *.log
+st_log.txt
+st_err.txt
+ws_server.log
+ws_server.err.log
+
+# 数据集（786MB 且超出 GitHub 单文件 100MB 上限，用 download_data.py 重新下载）
+training/datasets/
+
+# Ultralytics 训练缓存
+labels.cache
+
+# 测试输出留痕（测试脚本本身照常提交）
+bat_run.txt
+*_out.txt

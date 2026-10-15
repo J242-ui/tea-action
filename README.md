@@ -43,16 +43,28 @@ tea-garden-weather-service/
 │   ├── 2_风险预警.py
 │   ├── 3_智能问答.py
 │   ├── 4_农事建议.py          # 农事建议：类别筛选 + 参考建议 + 历史
-│   └── 5_我的茶园.py          # 登录用户增删改个人茶园
+│   ├── 5_我的茶园.py          # 登录用户增删改个人茶园
+│   └── 6_智能执行.py          # 🤖 Agent 控制台（新增：启动/停止/单步/状态）
 ├── src/
 │   ├── config.py             # 配置管理（环境变量/茶园数据）
 │   ├── weather.py            # 和风天气 API 客户端
-│   ├── llm.py                # 百度千帆大模型客户端
+│   ├── llm.py                # 大模型客户端（灾害研判/农事问答）
 │   ├── risk.py               # 风险研判规则引擎
 │   ├── push.py               # 农事建议引擎（生成日常农事建议卡片）
-│   ├── db.py                 # MySQL 数据访问层（users/gardens/push_log）
+│   ├── db.py                 # MySQL 数据访问层（users/gardens/push_log/...）
 │   ├── auth_ui.py            # 登录/注册/退出 UI 组件
-│   └── ui.py                 # 共享 UI 组件 + 游客/登录双模式逻辑
+│   ├── ui.py                 # 共享 UI 组件 + 游客/登录双模式逻辑
+│   ├── agent/                # 🤖 智能执行 Agent（新增）
+│   │   ├── decision.py       #   决策引擎：融合视觉+土壤+气象 → 执行指令
+│   │   └── runner.py         #   主循环：采集→推理→决策→执行→落库→广播
+│   ├── sensor/               # 🌱 土壤湿度传感器（新增，模拟+串口接口预留）
+│   ├── executor/             # ⚙️ 执行器状态机（新增：滴灌阀门/喷杆喷头）
+│   ├── vision/               # 📷 视觉模块（新增：OpenCV采集+YOLO推理+标注）
+│   └── ws_server.py          # 🖥 WebSocket 状态服务（新增，零依赖 ASGI）
+├── web/index.html            # 动态展示网页（新增：喷杆/阀门动画 + WS 实时推送）
+├── training/                 # 🎓 数据集下载与 YOLO 训练（新增）
+│   ├── download_data.py      #   下载 figshare 茶叶病害数据集（需网络）
+│   └── train_yolo.py         #   YOLOv8 训练（--quick 快速档 / --full 完整档）
 ├── data/tea_gardens.json     # 系统内置演示茶园配置
 ├── tests/                    # 单元测试
 ├── requirements.txt
@@ -84,8 +96,12 @@ cp env.example .env
 | 变量 | 说明 |
 | --- | --- |
 | `QWEATHER_API_KEY` | 和风天气 API Key，[申请地址](https://dev.qweather.com/) |
-| `QIANFAN_API_KEY` | 百度智能云千帆 API Key，[申请地址](https://console.bce.baidu.com/qianfan/ais/console/onlineService) |
-| `QIANFAN_MODEL` | 大模型名称，默认 `ernie-4.0-8k`；使用伏羲气象大模型时改为对应 model |
+| `QIANFAN_API_KEY` | **伏羲/文心大模型**（百度千帆）API Key，驱动气象灾害研判、病虫害分析、农事问答，[申请地址](https://console.bce.baidu.com/qianfan/ais/console/onlineService) |
+| `QIANFAN_BASE_URL` | 千帆接口地址，默认 `https://qianfan.baidubce.com/v2` |
+| `QIANFAN_MODEL` | 千帆模型名称，默认 `ernie-4.0-8k`；使用伏羲气象大模型时改为对应 model |
+| `QWEN_API_KEY` | **通义千问**（阿里云百炼）API Key，驱动「智能执行 Agent」的决策判断，[申请地址](https://bailian.console.aliyun.com/) |
+| `QWEN_BASE_URL` | 千问接口地址，默认 `https://dashscope.aliyuncs.com/compatible-mode/v1`（OpenAI 兼容） |
+| `QWEN_MODEL` | 千问模型名称，默认 `qwen-plus`；可换 `qwen-turbo` / `qwen-max` |
 | `DEMO_MODE` | `true` 时使用内置演示数据，无需真实 Key |
 | `DEV_MODE` | `true` 时侧边栏显示「开发者控制台」（模型状态 / 一键回测 / 手动重训） |
 
@@ -128,8 +144,18 @@ streamlit run app.py
 ### 4. 运行测试
 
 ```bash
+# 单元测试
 pytest tests/ -v
+
+# 全模块冒烟测试（无需任何配置，两轮自动跑完）
+python smoke_test.py                # ROUND 1：无 Key（演示/规则路径）
+python smoke_test.py --fake-key     # ROUND 2：假 Key（验证大模型失败回退与页面兜底）
+
+# 端到端验证（需 WS 服务 8510 已在运行）
+python e2e_test.py
 ```
+
+> 冒烟测试覆盖：配置/天气/风险研判/ML分类/时序/三引擎融合/Bandit/大模型客户端/视觉/传感器/执行器/规则决策/决策分发/Agent主循环/数据库/WS服务/首页与各页面编译。
 
 ## 🔐 用户与个人茶园
 
@@ -157,6 +183,101 @@ pytest tests/ -v
 - **新表**：`weather_history`（逐日气象归档）、`risk_feedback`（推送反馈样本）。
 - **页面接入**：`2_风险预警` 顶部「智能融合研判」；`4_农事建议` 顶部「今日智能推荐」均含反馈按钮。
 - 新增依赖：`scikit-learn`、`lightgbm`、`statsforecast`、`joblib`。
+
+## 🤖 智能执行 Agent（自动浇水 / 自动打药 / 动态展示）
+
+在气象服务之上新增的**智能执行子系统**，演示完整闭环：
+
+```
+USB摄像头/演示帧 → OpenCV → YOLO 推理(病害检测) ─┐
+土壤湿度传感器（模拟/串口） ──────────────────┤→ Agent 决策引擎
+气象 + 规则引擎风险 ─────────────────────────┘   (滞回防抖 + 连续计数)
+                                                   │ 执行指令(浇水/打药/停止)
+                                                   ▼
+                        WebSocket 状态服务 ──→ 网页动态展示
+                                              (喷杆喷头喷雾动画 / 滴灌阀门流水动画)
+```
+
+### 功能与决策规则
+
+- **自动浇水（滴灌阀门）**：土壤湿度 < 45% 且未来无大雨 → 开阀滴灌（时长按缺水量估算）；湿度回升到 68% 或出现降水 → 自动关阀（带滞回防抖）；阀门开启期间每轮决策显示「灌溉中」持续状态
+- **自动打药（喷杆喷头）**：连续 2 轮检出病害（置信度 ≥ 0.5）且非雨天、风力 < 4 级 → 启动喷雾；连续 3 轮无病害或遇雨/大风 → 自动停止
+- **降温喷灌**：气温 ≥ 33°C 且湿度 < 40% 时短时喷灌增湿（复用气象规则）
+- 传感器默认**软件模拟**（贴合茶树需水规律），`src/sensor/soil.py` 预留了串口驱动接口；执行器为**状态机模拟**，事件接口可直接转发到 ESP32/继电器驱动真实设备
+
+### 决策判断模式（双大模型分工）
+
+系统接入**两个大模型**，各司其职：
+
+| 职责 | 大模型 | 配置变量 | 无 Key 时 |
+| --- | --- | --- | --- |
+| **智能执行 Agent 决策**（浇水/打药/停止） | 通义千问 | `QWEN_*` | 完全走规则引擎（防抖/阈值/天气），页面显示模板解释 |
+| **气象灾害研判 / 病虫害分析 / 农事问答** | 伏羲（百度千帆） | `QIANFAN_*` | 页面进入演示模式（占位回复） |
+
+**智能执行 Agent 决策流程**：规则引擎先按防抖规则算出候选动作（防线不变）→ 配置了 `QWEN_API_KEY` 时交给**通义千问复核判断**（可同意、可调整时长、可改为不作业，并生成自然语言决策解释推送到网页）；大模型输出经**安全校验**（不得新增规则候选之外的设备动作、时长限幅、JSON 解析失败自动回退规则），防误检触发误操作。入口：`src/agent/llm_decision.py`；决策仍由 `src/agent/decision.py` 规则引擎兜底。
+
+**配置示例（`.env`）：**
+
+```dotenv
+# ---- 通义千问（驱动智能执行 Agent 决策判断）----
+QWEN_API_KEY=你的千问APIKey
+QWEN_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+QWEN_MODEL=qwen-plus
+
+# ---- 百度千帆 · 伏羲大模型（驱动灾害研判 / 病虫害分析 / 农事问答）----
+QIANFAN_API_KEY=你的千帆APIKey
+QIANFAN_BASE_URL=https://qianfan.baidubce.com/v2
+QIANFAN_MODEL=ernie-4.0-8k
+```
+
+> 两个 Key 相互独立、可单独配置：只配 `QWEN_API_KEY` → Agent 决策用千问、研判/问答仍是演示；只配 `QIANFAN_API_KEY` → 研判/问答走伏羲、Agent 决策仍是规则。配置后重启 WS 服务（`启动系统.bat`）与 Streamlit 即生效。
+
+
+### 启动方式
+
+```bash
+# 1. 启动动态展示服务（网页 + WebSocket，默认 127.0.0.1:8510）
+python -m src.ws_server
+
+# 2. 浏览器打开动态网页
+#    http://127.0.0.1:8510/     （执行器动画 + 实时画面）
+#    http://localhost:8501      （Streamlit 主站 → 侧边栏「智能执行」控制台）
+#    在 Streamlit 控制台点击「启动 Agent 主循环」或在网页 POST /api/agent/start
+```
+
+REST API：`GET /api/status`、`POST /api/agent/start|stop|step`、`GET /api/history`；WebSocket：`/ws`。
+
+### 病害检测模型（CNN）
+
+- 数据集：**figshare Tea-Leaf Disease and Pest Detection Dataset v1.0**（9,591 张 / 8 类 / YOLO 格式，CC BY 4.0）
+- 训练：`python training/download_data.py`（需网络，约 367MB）→ `python training/train_yolo.py --quick`（快速档，产出 `data/models/tea_yolo.pt`）
+- **未训练/未装依赖时自动降级**为模拟检测器（`backend=sim`），演示链路完整可用；模型就绪后 `backend=ultralytics` 无缝切换
+
+> ✅ **本机已训练完成**（2026-10）：`data/models/tea_yolo.pt`（快速档，23 轮，验证集 mAP50=0.818）。
+> 推理侧请用 **conda base 环境**（含 torch 2.14 + ultralytics + opencv，见下）；用项目 `.venv` 运行会因缺 torch 降级回模拟检测。
+
+### 运行环境说明（重要）
+
+真实模型推理需要 torch + ultralytics + opencv，当前已安装在 **conda base 环境**：
+
+```bash
+# 训练（已产出 tea_yolo.pt，可按需重训 --full 档）
+C:\Users\Lenovo\anaconda3\python.exe training\train_yolo.py --full
+
+# 启动动态展示服务（用 base 环境，才能加载真实模型）
+C:\Users\Lenovo\anaconda3\python.exe -m src.ws_server
+
+# 启动 Streamlit 主站（同样用 base 环境）
+C:\Users\Lenovo\anaconda3\python.exe -m streamlit run app.py
+```
+
+若改用项目 `.venv` 运行且希望真实推理，需在 venv 内补装：
+`pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu && pip install ultralytics opencv-python`
+（Windows 下如遇 `OMP: Error #15`，在启动前设 `$env:KMP_DUPLICATE_LIB_OK="TRUE"`，脚本内已自动设置。）
+
+### 新增数据表（自动建表）
+
+`sensor_log`（传感器读数）、`actuator_log`（执行器动作）、`agent_decision_log`（Agent 决策快照）。
 
 ## ⛺ 农事建议说明
 
@@ -189,6 +310,10 @@ pytest tests/ -v
 
 - `location_id`：和风天气城市 LocationID（可通过 `WeatherClient.search_city("城市名")` 查询）
 - 未填写 `location_id` 时，使用 `lon,lat` 作为查询位置
+
+## 📚 项目说明文档
+
+完整的分模块说明（架构、决策规则、双大模型、数据库、训练、配置与运行）：见 **`项目学习文档.md`**。
 
 ## 📄 许可证
 

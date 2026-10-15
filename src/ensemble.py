@@ -40,12 +40,17 @@ def garden_variety(garden: dict) -> str:
     return garden.get("variety") or ""
 
 
+def _gkey(garden: dict) -> str:
+    """兼容 {key} / {id} / 无键三种 garden 形态，避免 KeyError。"""
+    return garden.get("key") or garden.get("id") or "longjing"
+
+
 # ---------------------------------------------------------------------------
 # 数据打底
 # ---------------------------------------------------------------------------
 def ensure_data(garden: dict) -> int:
     """确保该茶园有历史气象数据：无则生成模拟历史；同时归档今日预报。返回历史条数。"""
-    key = garden["key"]
+    key = _gkey(garden)
     ml_risk.seed_history(key, garden, days=180)
     return db.weather_history_count(key)
 
@@ -61,10 +66,10 @@ def archive_today(garden: dict, data: dict) -> None:
         if not daily:
             return
         # 今日已归档则跳过
-        recent = db.weather_history_series(garden["key"], days=1)
+        recent = db.weather_history_series(_gkey(garden), days=1)
         if recent and str(recent[0]["obs_date"]) == date.today().isoformat():
             return
-        db.archive_weather(garden["key"], daily)
+        db.archive_weather(_gkey(garden), daily)
     except Exception:  # noqa: BLE001
         pass
 
@@ -83,13 +88,13 @@ def prepare(garden: dict, data: dict | None = None) -> dict:
 def ensure_models(garden: dict, force_retrain: bool = False) -> dict:
     """懒加载分类器与 bandit；样本足够且模型缺失时训练。返回引擎状态。"""
     status = {"ml_ready": False, "ts_ready": False, "history_days": 0, "bandit_updates": 0}
-    history = db.weather_history_series(garden["key"], days=365)
+    history = db.weather_history_series(_gkey(garden), days=365)
     status["history_days"] = len(history)
 
     # 分类器
     loaded = ml_risk.classifier.load()
     if not loaded or force_retrain:
-        ml_risk.classifier.train_from_history(garden["key"], garden, history=history, force=force_retrain)
+        ml_risk.classifier.train_from_history(_gkey(garden), garden, history=history, force=force_retrain)
         if not ml_risk.classifier.ready:
             ml_risk.classifier.load()
     status["ml_ready"] = ml_risk.classifier.ready
@@ -107,7 +112,7 @@ def run_ensemble(garden: dict, now: dict, daily: list[dict], air: dict | None = 
     """执行一次完整的融合研判。now/daily 来自和风返回（含 'now'/'daily' 壳）。"""
     n = now.get("now", now) if isinstance(now, dict) else now
     dl = daily.get("daily", daily) if isinstance(daily, dict) else (daily or [])
-    key = garden["key"]
+    key = _gkey(garden)
 
     # --- 规则引擎（兜底，产出具体风险项） ---
     engine = risk.RiskEngine()
@@ -173,7 +178,7 @@ def record_feedback(garden: dict, now: dict, proba: dict | None,
     bandit_mod.bandit.update(arm, ctx, reward)
     bandit_mod.bandit.save()
     db.log_risk_feedback(
-        garden_key=garden["key"], kind=kind, predicted_level=predicted_level,
+        garden_key=_gkey(garden), kind=kind, predicted_level=predicted_level,
         risk_name=arm, actual_level=actual_level, adopted=adopted,
         detail=detail, user_id=user_id,
     )
