@@ -134,41 +134,90 @@ def _line(frame, x0, y0, x1, y1, color, thickness):
 
 
 class CameraCapture:
-    """USB 摄像头采集（带自动降级）。"""
+    """USB 摄像头采集（带自动降级）。
+
+    帧来源标记：
+      - last_source == "usb_cam"    ：本轮画面来自摄像头实拍
+      - last_source == "demo_frame" ：摄像头不可用/读到无效（黑）帧，降级为演示合成帧
+    """
+
+    _BLACK_FRAME_MEAN = 8.0  # 平均亮度低于该值视为无效（黑）帧
 
     def __init__(self, index: int = 0, fallback: bool = True):
         self.index = index
         self.fallback = fallback
         self._cap = None
         self._lock = threading.Lock()
+        self.last_source = "demo_frame"
         self._open()
 
     def _open(self) -> None:
+        """按「原生后端优先」顺序打开摄像头：MSMF(Windows) → DSHOW → 默认。
+
+        Windows 上 OpenCV 默认 FFMPEG 后端打开摄像头不稳定（黑帧/失败），
+        显式使用 Media Foundation / DirectShow 更可靠。
+        """
         try:
             import cv2
-            cap = cv2.VideoCapture(self.index)
-            if cap.isOpened():
-                self._cap = cap
+            backends = []
+            for name in ("CAP_MSMF", "CAP_DSHOW"):
+                if hasattr(cv2, name):
+                    backends.append(getattr(cv2, name))
+            backends.append(cv2.CAP_ANY)
+            for backend in backends:
+                try:
+                    cap = cv2.VideoCapture(self.index, backend)
+                except Exception:  # noqa: BLE001
+                    cap = cv2.VideoCapture(self.index)
+                if cap is not None and cap.isOpened():
+                    self._cap = cap
+                    return
         except Exception:  # noqa: BLE001
-            self._cap = None
+            pass
+        self._cap = None
 
     @property
     def available(self) -> bool:
         return self._cap is not None
 
+    def _read_valid_frame(self) -> np.ndarray | None:
+        """尝试从当前摄像头句柄读一帧有效（非黑）画面。"""
+        if self._cap is None:
+            return None
+        try:
+            import cv2
+            ok, frame = self._cap.read()
+            if (ok and frame is not None and frame.size > 0
+                    and float(frame.mean()) >= self._BLACK_FRAME_MEAN):
+                return frame
+        except Exception:  # noqa: BLE001
+            pass
+        return None
+
     def read_frame(self) -> np.ndarray | None:
-        """读取一帧 BGR 图像。摄像头不可用时返回演示合成帧（fallback 开启时）。"""
+        """读取一帧 BGR 图像。
+
+        摄像头不可用，或读到无效（纯黑）帧时：
+          1) 先重新打开摄像头再试一次（句柄可能失效/预热未完成）
+          2) 仍无有效画面 → fallback 开启时返回演示合成帧
+        帧来源记录在 last_source：usb_cam / demo_frame。
+        """
         with self._lock:
-            if self._cap is not None:
-                try:
-                    import cv2
-                    ok, frame = self._cap.read()
-                    if ok and frame is not None and frame.size > 0:
-                        return frame
-                except Exception:  # noqa: BLE001
-                    pass
+            frame = self._read_valid_frame()
+            if frame is not None:
+                self.last_source = "usb_cam"
+                return frame
+            # 黑帧/读取失败 → 重建句柄再试一次（可解决占用恢复、驱动瞬态问题）
+            self.release()
+            self._open()
+            frame = self._read_valid_frame()
+            if frame is not None:
+                self.last_source = "usb_cam"
+                return frame
         if self.fallback:
+            self.last_source = "demo_frame"
             return make_demo_frame()
+        self.last_source = "none"
         return None
 
     def release(self) -> None:

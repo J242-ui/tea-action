@@ -8,6 +8,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+from datetime import datetime
 
 import pandas as pd
 import requests
@@ -22,6 +23,18 @@ DECISION_CN = {
     "irrigate": "💧 自动浇水", "irrigating": "💧 灌溉中", "spray": "🚿 自动打药", "cool": "❄️ 降温喷灌",
     "stop": "⏹ 停止作业", "noop": "✔ 无操作",
 }
+
+
+def _fmt_time(v) -> str:
+    """把 created_at 统一格式化为 'MM-DD HH:MM'。
+
+    兼容两种来源：REST 接口返回的字符串（如 "2026-10-16T02:06:35"），
+    以及直连 MySQL 时 pymysql 自动转换出的 datetime 对象。
+    """
+    if isinstance(v, datetime):
+        return v.strftime("%m-%d %H:%M")
+    s = str(v or "")
+    return s[5:16] if len(s) >= 16 else s
 
 
 def ws_alive() -> bool:
@@ -108,8 +121,10 @@ def main() -> None:
         st.subheader("📷 视觉检测画面")
         img = (snap.get("detections") or {}).get("image", "")
         if img:
-            st.image(img, caption=f"检测帧（{snap.get('detections', {}).get('backend', '?')}）",
-                     width="stretch")
+            src = (snap.get("detections") or {}).get("source", "demo_frame")
+            backend = (snap.get("detections") or {}).get("backend", "?")
+            src_cn = "USB 摄像头实拍" if src == "usb_cam" else "演示帧（摄像头不可用）"
+            st.image(img, caption=f"检测帧（{backend} · 来源：{src_cn}）", width="stretch")
         else:
             st.info("暂无画面：请点击「立即执行一步」生成检测帧。")
 
@@ -129,7 +144,7 @@ def main() -> None:
             st.divider()
             st.subheader("📜 Agent 决策历史")
             rows = [{
-                "时间": (i.get("created_at") or "")[5:16],
+                "时间": _fmt_time(i.get("created_at")),
                 "决策": DECISION_CN.get(i.get("decision_type"), i.get("decision_type")),
                 "等级": LEVEL_CN.get(i.get("overall_level", "low")),
                 "摘要": (i.get("summary") or "")[:80],
@@ -186,7 +201,7 @@ def _render_history(garden: dict) -> None:
     if rows:
         st.subheader("📜 Agent 决策历史（数据库）")
         df = pd.DataFrame([{
-            "时间": (r.get("created_at") or "")[5:16],
+            "时间": _fmt_time(r.get("created_at")),
             "决策": DECISION_CN.get(r.get("decision_type"), r.get("decision_type")),
             "等级": LEVEL_CN.get(r.get("overall_level", "low")),
             "摘要": (r.get("summary") or "")[:80],

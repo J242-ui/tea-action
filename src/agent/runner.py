@@ -91,9 +91,9 @@ class AgentRunner:
         except Exception:  # noqa: BLE001 - 数据库不可用时降级跳过
             pass
 
-        # 2) 视觉
+        # 2) 视觉（帧来源：摄像头实拍 / 演示帧，由 camera.last_source 标记）
         frame = camera.read_frame()
-        det_result = detector.detect(frame)
+        det_result = detector.detect(frame, source_hint=getattr(camera, "last_source", "demo_frame"))
         frame_shape = det_result.get("frame_shape") or (list(frame.shape[:2]) if frame is not None else [480, 640])
 
         # 3) 气象（网络不可用/无 Key 时降级演示数据）
@@ -140,7 +140,8 @@ class AgentRunner:
         snapshot = {
             "ts": _ts(),
             "garden": {"key": self.garden_key, "name": garden.get("name", self.garden_key)},
-            "camera": {"available": camera.available, "backend": det_result.get("backend", "sim")},
+            "camera": {"available": camera.available, "backend": det_result.get("backend", "sim"),
+                       "source": det_result.get("source", "demo_frame")},
             "soil": soil,
             "detections": {**det_result, "image": image_b64},
             "actuator": bus.snapshot(),

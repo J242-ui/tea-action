@@ -145,18 +145,23 @@ class TeaDiseaseDetector:
         self._try_load()
         return self.ready
 
-    def detect(self, frame: np.ndarray | None = None) -> dict:
-        """对一帧图像做病害检测，返回统一结构。模型不可用时降级为模拟检测。"""
+    def detect(self, frame: np.ndarray | None = None, source_hint: str | None = None) -> dict:
+        """对一帧图像做病害检测，返回统一结构。
+
+        source_hint：帧的实际来源（"usb_cam" / "demo_frame"），由调用方（Agent 主循环）
+        根据摄像头是否读到有效画面传入，用于在页面上区分「摄像头实拍」与「演示帧」。
+        模型不可用时降级为模拟检测。
+        """
         if frame is None:
             frame = make_demo_frame()
         if self.model is not None:
             try:
-                return self._detect_real(frame)
+                return self._detect_real(frame, source_hint)
             except Exception:  # noqa: BLE001 - 推理异常降级
                 pass
         return self._sim.detect(frame)
 
-    def _detect_real(self, frame: np.ndarray) -> dict:
+    def _detect_real(self, frame: np.ndarray, source_hint: str | None = None) -> dict:
         results = self.model.predict(frame, conf=0.25, iou=0.5, verbose=False)
         detections = []
         names = self.model.names if hasattr(self.model, "names") else CLASS_NAMES
@@ -171,7 +176,8 @@ class TeaDiseaseDetector:
                     "conf": conf,
                     "bbox": [x1, y1, x2, y2],
                 })
-        return build_detection_result(detections, source="usb_cam", backend="ultralytics",
+        source = source_hint or "usb_cam"
+        return build_detection_result(detections, source=source, backend="ultralytics",
                                       model=self.model_path, frame=frame)
 
 

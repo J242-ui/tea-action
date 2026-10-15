@@ -247,13 +247,14 @@ function render(s) {
   $("agentPillText").textContent = s.running ? "Agent 运行中" : "Agent 已停止";
   $("steps").textContent = s.steps || 0;
 
-  // 摄像头
-  $("camPillText").textContent = s.camera && s.camera.available ? "USB摄像头" : "演示帧";
+  // 摄像头（以实际帧来源为准：摄像头实拍 / 演示帧降级）
+  const camSrc = (s.detections && s.detections.source) || "demo_frame";
+  $("camPillText").textContent = (camSrc === "usb_cam") ? "USB摄像头" : "演示帧";
   $("modelTag").textContent = (s.detections && s.detections.backend === "ultralytics")
     ? "YOLO 模型" : "模拟检测(降级)";
   if (s.detections && s.detections.image) {
     $("camImg").src = s.detections.image;
-    $("camBadge").textContent = (s.detections.source === "usb_cam") ? "USB摄像头" : "演示帧";
+    $("camBadge").textContent = (camSrc === "usb_cam") ? "USB摄像头实拍" : "演示帧（摄像头不可用）";
   }
   // 检测列表
   const detList = $("detList");
