@@ -12,6 +12,7 @@
 - **风险预警（分级机制）**：将每条风险按 低/中/高 归档到 持续观察/提前预防/紧急处置 三档，整园预警档位取最高风险，并按档位给出对应处置动作与预案
 - **农事建议**（原智能推送转型）：剥离风险告警，专注基于天气与物候的日常农事操作参考（浇水、施肥、打药、采摘等），按类别筛选并可看历史
 - **多茶园**：内置多个产茶区茶园配置（龙井、碧螺春、武夷岩茶、铁观音、信阳毛尖），也可在登录后自助添加
+- **智能执行 Agent**：USB 摄像头/演示帧 + YOLO 病害检测 → 自动浇水/自动打药/停止决策（双大模型复核），WebSocket 实时推送执行器动画；支持「持续录像 / 自定义刷新时间」双刷新模式与主站实时画面
 - **演示模式**：未配置 API Key 时自动使用内置演示数据，便于快速体验界面
 
 ## 🏗 技术架构
@@ -56,7 +57,8 @@ tea-garden-weather-service/
 │   ├── ui.py                 # 共享 UI 组件 + 游客/登录双模式逻辑
 │   ├── agent/                # 🤖 智能执行 Agent（新增）
 │   │   ├── decision.py       #   决策引擎：融合视觉+土壤+气象 → 执行指令
-│   │   └── runner.py         #   主循环：采集→推理→决策→执行→落库→广播
+│   │   ├── llm_decision.py   #   千问大模型复核判断（可同意/调时长/不作业）
+│   │   └── runner.py         #   主循环：持续录像/自定义间隔双模式 → 决策 → 广播
 │   ├── sensor/               # 🌱 土壤湿度传感器（新增，模拟+串口接口预留）
 │   ├── executor/             # ⚙️ 执行器状态机（新增：滴灌阀门/喷杆喷头）
 │   ├── vision/               # 📷 视觉模块（新增：OpenCV采集+YOLO推理+标注）
@@ -104,6 +106,8 @@ cp env.example .env
 | `QWEN_MODEL` | 千问模型名称，默认 `qwen-plus`；可换 `qwen-turbo` / `qwen-max` |
 | `DEMO_MODE` | `true` 时使用内置演示数据，无需真实 Key |
 | `DEV_MODE` | `true` 时侧边栏显示「开发者控制台」（模型状态 / 一键回测 / 手动重训） |
+| `AGENT_WS_HOST` / `AGENT_WS_PORT` | 智能执行动态展示服务监听地址/端口，默认 `127.0.0.1:8510` |
+| `AGENT_INTERVAL` | Agent 决策间隔（秒），默认 `5`，最小 `0.5`；可在「智能执行」页运行时调整 |
 
 **本地配置（开发）：**
 
@@ -245,7 +249,17 @@ python -m src.ws_server
 #    在 Streamlit 控制台点击「启动 Agent 主循环」或在网页 POST /api/agent/start
 ```
 
-REST API：`GET /api/status`、`POST /api/agent/start|stop|step`、`GET /api/history`；WebSocket：`/ws`。
+REST API：`GET /api/status`、`GET /api/frame`（最近一帧画面）、`GET /api/history`、`POST /api/agent/start|stop|step|config`（`config` 运行时修改刷新模式/间隔）；WebSocket：`/ws`（`state_update` 完整快照 + `stream_frame` 画面帧）。
+
+### 刷新设置与实时画面
+
+- **双刷新模式**（默认 5 秒，最小 0.5 秒，可在「智能执行」页「⏱ 刷新设置」区运行时切换并应用）：
+  - **自定义刷新时间**：整轮（采集→推理→决策→推送）按设定间隔执行
+  - **持续录像**：画面约 0.2 秒/帧连续推送（`stream_frame` 事件），决策按间隔节流，画面如监控般流畅
+- **主站实时画面**（「智能执行」页「📹 实时画面」开关，默认开启）：
+  - **方案 A**：页面内 WebSocket 订阅 `/ws` 缓存画面帧，`@st.fragment(run_every=1.0)` 约 1 秒自动刷新渲染
+  - **方案 B**：WS 服务缓存最近一帧（`runner.latest_frame`），`GET /api/frame` 接口兜底拉取，WS 短暂断开时画面仍可用
+- **画面来源标识**：网页角标与页面标题实时标注当前帧是「USB摄像头实拍」还是「演示帧（摄像头不可用）」；摄像头打开优先 Windows 原生后端（MSMF/DSHOW），读到黑帧自动重建句柄重试
 
 ### 病害检测模型（CNN）
 

@@ -244,7 +244,9 @@ function render(s) {
   // Agent 状态
   const pill = $("agentPill");
   pill.className = "status-pill " + (s.running ? "running" : "stopped");
-  $("agentPillText").textContent = s.running ? "Agent 运行中" : "Agent 已停止";
+  $("agentPillText").textContent = s.running
+    ? (s.refresh_mode === "stream" ? "Agent 运行中 · 持续录像" : `Agent 运行中 · ${(s.interval || 0).toFixed(1)}s 刷新`)
+    : "Agent 已停止";
   $("steps").textContent = s.steps || 0;
 
   // 摄像头（以实际帧来源为准：摄像头实拍 / 演示帧降级）
@@ -349,6 +351,38 @@ function renderBoom(b) {
   $("boomGroup").classList.toggle("boom-swing", on);
 }
 
+// ---- 持续录像帧：仅刷新画面区与状态条（决策/传感器/执行器保留最近一次完整快照）----
+function renderFrame(s) {
+  const camSrc = (s.detections && s.detections.source) || "demo_frame";
+  $("camPillText").textContent = (camSrc === "usb_cam") ? "USB摄像头" : "演示帧";
+  $("modelTag").textContent = (s.detections && s.detections.backend === "ultralytics")
+    ? "YOLO 模型" : "模拟检测(降级)";
+  if (s.detections && s.detections.image) {
+    $("camImg").src = s.detections.image;
+    $("camBadge").textContent = (camSrc === "usb_cam") ? "USB摄像头实拍" : "演示帧（摄像头不可用）";
+  }
+  const detList = $("detList");
+  detList.innerHTML = "";
+  ((s.detections && s.detections.detections) || []).forEach(d => {
+    const el = document.createElement("span");
+    el.className = "det " + (d["class"] === "Healthy" ? "healthy" : "disease");
+    el.textContent = `${d["class"]} ${(d.conf * 100).toFixed(0)}%`;
+    detList.appendChild(el);
+  });
+  const sm = (s.detections && s.detections.summary) || {};
+  $("detSummary").textContent = sm.total !== undefined
+    ? `共检出 ${sm.total} 处 · ${sm.diseases && sm.diseases.length ? "病害: " + sm.diseases.join("、") : "无病害"}`
+    : "等待检测…";
+  if (s.running !== undefined) {
+    const pill = $("agentPill");
+    pill.className = "status-pill " + (s.running ? "running" : "stopped");
+    $("agentPillText").textContent = s.running
+      ? (s.refresh_mode === "stream" ? "Agent 运行中 · 持续录像" : `Agent 运行中 · ${(s.interval || 0).toFixed(1)}s 刷新`)
+      : "Agent 已停止";
+  }
+  if (s.steps !== undefined) $("steps").textContent = s.steps || 0;
+}
+
 // ---- WebSocket 连接 ----
 let ws = null;
 function connect() {
@@ -359,6 +393,7 @@ function connect() {
     try {
       const msg = JSON.parse(e.data);
       if (msg.kind === "state_update") render(msg.data);
+      if (msg.kind === "stream_frame") renderFrame(msg.data);
       if (msg.kind === "agent_error") {
         $("agentPill").className = "status-pill error";
         $("agentPillText").textContent = "Agent 异常";

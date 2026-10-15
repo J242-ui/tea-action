@@ -94,6 +94,23 @@ class TeaAgentASGI:
         ctype = "application/json; charset=utf-8"
         body = b'{"ok":false,"message":"not found"}'
 
+        # POST 请求读取 JSON body（供 start/config 传入刷新参数）
+        payload: dict = {}
+        if method == "POST":
+            body_raw = b""
+            while True:
+                msg = await receive()
+                if msg["type"] == "http.request":
+                    body_raw += msg.get("body", b"")
+                    if not msg.get("more_body"):
+                        break
+            if body_raw:
+                try:
+                    parsed = json.loads(body_raw.decode("utf-8"))
+                    payload = parsed if isinstance(parsed, dict) else {}
+                except Exception:  # noqa: BLE001 - body 非 JSON 时按空参数处理
+                    payload = {}
+
         try:
             if method == "GET" and path in ("/", "/index.html"):
                 ctype = "text/html; charset=utf-8"
@@ -105,13 +122,27 @@ class TeaAgentASGI:
                     "running": runner.running,
                     "steps": runner.steps,
                     "interval": runner.interval,
+                    "refresh_mode": runner.refresh_mode,
                     "garden_key": runner.garden_key,
                     "latest": runner.latest,
                 })
+            elif method == "GET" and path == "/api/frame":
+                # 最近一帧画面（持续录像帧或完整轮次帧），供主站实时画面拉取
+                body = _json_body(runner.latest_frame)
             elif method == "GET" and path == "/api/history":
                 body = _json_body({"items": db.agent_decision_history(runner.garden_key, limit=20)})
             elif method == "POST" and path == "/api/agent/start":
-                body = _json_body({"ok": runner.start(), "running": runner.running})
+                # 支持可选 body: {"refresh_mode": "stream"|"interval", "interval": 秒}
+                runner.configure(refresh_mode=payload.get("refresh_mode"),
+                                 interval=payload.get("interval"))
+                body = _json_body({"ok": runner.start(), "running": runner.running,
+                                   "refresh_mode": runner.refresh_mode,
+                                   "interval": runner.interval})
+            elif method == "POST" and path == "/api/agent/config":
+                # 运行时修改刷新模式与间隔（不改变运行/停止状态）
+                cfg = runner.configure(refresh_mode=payload.get("refresh_mode"),
+                                       interval=payload.get("interval"))
+                body = _json_body({"ok": True, **cfg})
             elif method == "POST" and path == "/api/agent/stop":
                 body = _json_body({"ok": runner.stop(), "running": runner.running})
             elif method == "POST" and path == "/api/agent/step":

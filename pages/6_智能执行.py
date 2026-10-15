@@ -8,6 +8,8 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import threading
+import time
 from datetime import datetime
 
 import pandas as pd
@@ -17,6 +19,11 @@ import streamlit as st
 from src import config, db, ui
 
 WS_BASE = f"http://127.0.0.1:{os.getenv('AGENT_WS_PORT', '8510')}"
+
+# 实时画面缓存：后台 WS 订阅线程写入（方案 A），页面 fragment 读取渲染
+_FRAME_CACHE: dict = {}
+_FRAME_LOCK = threading.Lock()
+_WS_LISTENER: threading.Thread | None = None
 
 LEVEL_CN = {"low": "低", "medium": "中", "high": "高"}
 DECISION_CN = {
@@ -45,13 +52,87 @@ def ws_alive() -> bool:
         return False
 
 
-def _api(path: str, method: str = "GET", timeout: int = 30):
+def _api(path: str, method: str = "GET", timeout: int = 30, data: dict | None = None):
     try:
         if method == "POST":
+            if data is not None:
+                return requests.post(f"{WS_BASE}{path}", json=data, timeout=timeout).json()
             return requests.post(f"{WS_BASE}{path}", timeout=timeout).json()
         return requests.get(f"{WS_BASE}{path}", timeout=timeout).json()
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "message": str(e)}
+
+
+def _ensure_ws_listener() -> bool:
+    """确保后台 WS 订阅线程运行（幂等）。
+
+    方案 A：页面内直接订阅 /ws，收到 stream_frame / state_update 帧后写入
+    _FRAME_CACHE；断线自动 2 秒重连。供「实时画面」fragment 渲染。
+    """
+    global _WS_LISTENER
+    if _WS_LISTENER is not None and _WS_LISTENER.is_alive():
+        return True
+    if not ws_alive():
+        return False
+
+    def _run() -> None:
+        import asyncio
+        import json as _json
+
+        import websockets
+        uri = f"ws://127.0.0.1:{os.getenv('AGENT_WS_PORT', '8510')}/ws"
+
+        async def _listen() -> None:
+            async with websockets.connect(uri) as ws:
+                while True:
+                    try:
+                        msg = _json.loads(await asyncio.wait_for(ws.recv(), timeout=5))
+                    except asyncio.TimeoutError:
+                        continue
+                    data = msg.get("data") or {}
+                    det = data.get("detections") or {}
+                    img = det.get("image")
+                    if img and msg.get("kind") in ("stream_frame", "state_update"):
+                        with _FRAME_LOCK:
+                            _FRAME_CACHE.update({
+                                "ts": data.get("ts"),
+                                "image": img,
+                                "source": det.get("source", "demo_frame"),
+                                "backend": det.get("backend", "sim"),
+                            })
+
+        while True:
+            try:
+                asyncio.run(_listen())
+            except Exception:  # noqa: BLE001 - 断线重连
+                time.sleep(2)
+
+    _WS_LISTENER = threading.Thread(target=_run, daemon=True, name="page-ws-frame-listener")
+    _WS_LISTENER.start()
+    return True
+
+
+def _render_live_frame() -> None:
+    """实时画面片段（fragment，约 1 秒自动刷新）。
+
+    优先读 WebSocket 订阅缓存帧（方案 A）；缓存无帧时拉取 /api/frame 兜底（方案 B）。
+    """
+    with _FRAME_LOCK:
+        cache = dict(_FRAME_CACHE)
+    img, src, ts = None, "demo_frame", ""
+    if cache.get("image"):
+        img, src, ts = cache["image"], cache.get("source", "demo_frame"), cache.get("ts", "")
+    else:
+        f = _api("/api/frame", timeout=3)
+        if f.get("image"):
+            img, src, ts = f["image"], f.get("source", "demo_frame"), f.get("ts", "")
+    if img:
+        st.image(img, use_container_width=True)
+        src_txt = "USB摄像头实拍" if src == "usb_cam" else "演示帧（摄像头不可用）"
+        suffix = f" ｜ 帧时间 {str(ts)[11:19]}" if ts else ""
+        st.caption(f"实时画面 · 来源：{src_txt}{suffix}")
+    else:
+        st.info("实时画面等待中…（Agent 未运行或无帧，可先启动 Agent）")
 
 
 def _start_ws_service() -> bool:
@@ -114,19 +195,64 @@ def main() -> None:
     status = _api("/api/status")
     snap = status.get("latest") or {}
 
+    # ---------- 刷新设置区 ----------
+    cur_mode = status.get("refresh_mode", "interval")
+    cur_interval = float(status.get("interval", 5.0) or 5.0)
+    st.divider()
+    st.markdown("### ⏱ 刷新设置")
+    st.caption(
+        "「持续录像」：画面连续推送（约 0.2 秒/帧，适合观察实时画面）；「自定义刷新时间」："
+        "整轮（采集→推理→决策→推送）按设定间隔执行。间隔越小 CPU 占用越高，最小 0.5 秒。"
+    )
+    r1, r2, r3 = st.columns([2, 2, 1])
+    with r1:
+        mode = st.radio("刷新模式", ["自定义刷新时间", "持续录像"], horizontal=True,
+                        index=0 if cur_mode != "stream" else 1)
+    with r2:
+        interval = st.number_input("自定义刷新间隔（秒）", min_value=0.5, max_value=60.0,
+                                   value=float(cur_interval), step=0.5)
+    with r3:
+        st.markdown("")
+        st.markdown("")
+        if st.button("✅ 应用刷新设置", type="primary"):
+            cfg = _api("/api/agent/config", "POST",
+                       data={"refresh_mode": "stream" if mode == "持续录像" else "interval",
+                             "interval": float(interval)})
+            st.toast("刷新设置已应用" if cfg.get("ok") else f"应用失败：{cfg.get('message')}")
+            if cfg.get("ok"):
+                st.rerun()
+
+    t1, t2 = st.columns([1, 3])
+    with t1:
+        live_on = st.toggle("📹 实时画面", value=st.session_state.get("live_on", True),
+                            key="live_on")
+    with t2:
+        st.caption("开启后本页画面实时刷新（约 1 秒/帧）：优先走 WebSocket 推送帧（A），"
+                   "不可用时自动拉取 /api/frame 兜底（B）。")
+    if live_on:
+        _ensure_ws_listener()
+
     col_left, col_right = st.columns([3, 2])
 
     # ---------- 左：实时画面 + 检测 ----------
     with col_left:
         st.subheader("📷 视觉检测画面")
-        img = (snap.get("detections") or {}).get("image", "")
-        if img:
-            src = (snap.get("detections") or {}).get("source", "demo_frame")
-            backend = (snap.get("detections") or {}).get("backend", "?")
-            src_cn = "USB 摄像头实拍" if src == "usb_cam" else "演示帧（摄像头不可用）"
-            st.image(img, caption=f"检测帧（{backend} · 来源：{src_cn}）", width="stretch")
+        if st.session_state.get("live_on", True):
+            # 实时画面：fragment 约 1 秒自动刷新（方案 A 缓存优先，方案 B 接口兜底）
+            @st.fragment(run_every=1.0)
+            def _live():
+                _render_live_frame()
+
+            _live()
         else:
-            st.info("暂无画面：请点击「立即执行一步」生成检测帧。")
+            img = (snap.get("detections") or {}).get("image", "")
+            if img:
+                src = (snap.get("detections") or {}).get("source", "demo_frame")
+                backend = (snap.get("detections") or {}).get("backend", "?")
+                src_cn = "USB 摄像头实拍" if src == "usb_cam" else "演示帧（摄像头不可用）"
+                st.image(img, caption=f"检测帧（{backend} · 来源：{src_cn}）", width="stretch")
+            else:
+                st.info("暂无画面：请点击「立即执行一步」生成检测帧。")
 
         dets = (snap.get("detections") or {}).get("detections", [])
         if dets:
@@ -191,8 +317,10 @@ def main() -> None:
 
         # Agent 状态
         st.divider()
+        _mode_label = "持续录像" if status.get("refresh_mode") == "stream" \
+            else f"{float(status.get('interval', 5.0) or 5.0):.1f}s 间隔"
         st.caption(f"Agent 状态：{'🟢 运行中' if status.get('running') else '⚪ 已停止'} ｜ "
-                   f"已执行 {status.get('steps', 0)} 轮 ｜ 间隔 {status.get('interval', 10)}s")
+                   f"已执行 {status.get('steps', 0)} 轮 ｜ 刷新：{_mode_label}")
 
 
 def _render_history(garden: dict) -> None:

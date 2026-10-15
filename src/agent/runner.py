@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 from datetime import datetime
 from typing import Callable
 
@@ -26,9 +27,12 @@ DEFAULT_GARDEN_KEY = "longjing"
 class AgentRunner:
     """智能执行 Agent 主循环。"""
 
-    def __init__(self, garden_key: str = DEFAULT_GARDEN_KEY, interval: float = 10.0):
+    def __init__(self, garden_key: str = DEFAULT_GARDEN_KEY, interval: float = 5.0,
+                 refresh_mode: str = "interval"):
         self.garden_key = garden_key
-        self.interval = max(3.0, float(interval))
+        # refresh_mode: "interval" 自定义间隔整轮执行；"stream" 持续录像（画面连续推送，决策按间隔节流）
+        self.refresh_mode = "stream" if str(refresh_mode).strip().lower() == "stream" else "interval"
+        self.interval = max(0.5, float(interval))
         self._thread: threading.Thread | None = None
         self._stop_evt = threading.Event()
         self._lock = threading.Lock()
@@ -36,7 +40,9 @@ class AgentRunner:
         self.running = False
         self.steps = 0
         self.latest: dict = {}
+        self.latest_frame: dict = {}  # 最近一帧画面（stream_frame 与完整轮次都会更新，供 /api/frame 与主站实时画面读取）
         self._decision_state: dict = {}
+        self._last_full = 0.0  # 持续录像模式下最近一次完整决策的单调钟时间
 
     # ---------- 事件订阅 ----------
     def subscribe(self, listener: Callable[[dict], None]) -> None:
@@ -48,6 +54,20 @@ class AgentRunner:
                 fn(event)
             except Exception:  # noqa: BLE001
                 pass
+
+    # ---------- 配置 ----------
+    def configure(self, refresh_mode: str | None = None, interval: float | None = None) -> dict:
+        """运行时更新刷新模式与间隔（线程安全）。
+
+        refresh_mode: "interval"（自定义刷新时间） / "stream"（持续录像）
+        interval: 刷新间隔秒数，最小 0.5 秒。
+        """
+        with self._lock:
+            if refresh_mode is not None:
+                self.refresh_mode = "stream" if str(refresh_mode).strip().lower() == "stream" else "interval"
+            if interval is not None:
+                self.interval = max(0.5, float(interval))
+        return {"refresh_mode": self.refresh_mode, "interval": self.interval}
 
     # ---------- 生命周期 ----------
     def start(self) -> bool:
@@ -74,10 +94,58 @@ class AgentRunner:
     def _loop(self) -> None:
         while not self._stop_evt.is_set():
             try:
-                self.step()
+                if self.refresh_mode == "stream":
+                    # 持续录像：高频推流画面帧；完整决策按间隔节流
+                    self._stream_tick()
+                    self._stop_evt.wait(0.2)
+                    if time.monotonic() - self._last_full >= self.interval:
+                        self._last_full = time.monotonic()
+                        self.step()
+                else:
+                    self.step()
+                    self._stop_evt.wait(self.interval)
             except Exception as e:  # noqa: BLE001 - 单轮失败不中断循环
                 self._broadcast({"kind": "agent_error", "message": str(e), "ts": _ts()})
-            self._stop_evt.wait(self.interval)
+                self._stop_evt.wait(self.interval)
+
+    def _set_latest_frame(self, det_result: dict, image_b64: str) -> None:
+        """写入最近一帧画面缓存（供 /api/frame 与主站实时画面读取）。"""
+        with self._lock:
+            self.latest_frame = {
+                "ts": _ts(),
+                "source": det_result.get("source", "demo_frame"),
+                "backend": det_result.get("backend", "sim"),
+                "image": image_b64,
+                "detections": det_result.get("detections", []),
+                "summary": det_result.get("summary", {}),
+            }
+
+    def _stream_tick(self) -> None:
+        """持续录像模式：只做「采集→推理→标注→推送画面帧」，不落库、不决策、不覆盖完整快照。
+
+        前端收到 kind=stream_frame 事件后仅刷新画面区；完整快照（决策/执行器/传感器）
+        仍由按间隔节流的 step() 生成并推送（kind=state_update）。
+        """
+        frame = camera.read_frame()
+        det_result = detector.detect(frame, source_hint=getattr(camera, "last_source", "demo_frame"))
+        image_b64 = ""
+        if frame is not None:
+            annotated = annotate.draw_detections(frame, det_result)
+            image_b64 = annotate.frame_to_base64(annotated)
+        self._set_latest_frame(det_result, image_b64)
+        self._broadcast({
+            "kind": "stream_frame",
+            "data": {
+                "ts": _ts(),
+                "camera": {"available": camera.available, "backend": det_result.get("backend", "sim"),
+                           "source": det_result.get("source", "demo_frame")},
+                "detections": {**det_result, "image": image_b64},
+                "steps": self.steps,
+                "running": self.running,
+                "interval": self.interval,
+                "refresh_mode": self.refresh_mode,
+            },
+        })
 
     # ---------- 单轮决策 ----------
     def step(self) -> dict:
@@ -135,6 +203,7 @@ class AgentRunner:
         if frame is not None:
             annotated = annotate.draw_detections(frame, det_result)
             image_b64 = annotate.frame_to_base64(annotated)
+        self._set_latest_frame(det_result, image_b64)
 
         # 8) 状态快照 + 广播
         snapshot = {
@@ -150,6 +219,7 @@ class AgentRunner:
             "steps": self.steps,
             "running": self.running,
             "interval": self.interval,
+            "refresh_mode": self.refresh_mode,
         }
         self.steps += 1
         snapshot["steps"] = self.steps
@@ -204,4 +274,5 @@ def _ts() -> str:
 
 
 # 模块级单例（供 WS 服务 / Streamlit 页面共享）
-runner = AgentRunner(interval=float(os.getenv("AGENT_INTERVAL", "10")))
+# 默认 5 秒刷新；最小 0.5 秒；可通过 /api/agent/config 或「智能执行」页运行时调整
+runner = AgentRunner(interval=float(os.getenv("AGENT_INTERVAL", "5")))
