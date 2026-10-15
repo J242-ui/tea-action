@@ -15,6 +15,7 @@
        - 触发：连续 CONSECUTIVE_SPRAY 次检测到病害且置信度 ≥ SPRAY_CONF，
                且非雨天、风力 < 4 级
        - 停止  ：连续 CONSECUTIVE_STOP 次无病害，或遇雨/大风
+       - 冷却  ：上次喷雾结束后 SPRAY_COOLDOWN_MIN 分钟内不重复开启喷雾（防"喷完又喷"）
   3. 降温喷灌（spray_boom 短时）：最高温 ≥33°C 且湿度 <40%（复用气象规则）
 
 输出：
@@ -32,6 +33,7 @@ MIN_PER_PCT = 1.2          # 每差 1% 湿度约需滴灌时长(分钟)
 SPRAY_CONF = 0.50          # 病害置信度阈值
 CONSECUTIVE_SPRAY = 2      # 连续 N 次检出病害才打药（防抖动）
 CONSECUTIVE_STOP = 3       # 连续 N 次无病害才停
+SPRAY_COOLDOWN_MIN = 30.0  # 上次喷雾结束后 N 分钟内不重复开启喷雾（冷却防抖）
 RAIN_LIMIT_MM = 10.0       # 未来单日降水 ≥ 该值视为雨天
 WIND_LIMIT_LEVEL = 4       # 风力 ≥ 4 级不打药
 COOL_TEMP = 33.0           # 降温喷灌触发温度
@@ -62,6 +64,25 @@ def _diseases(detections: dict) -> list[dict]:
             if d["class"] != "Healthy" and _num(d.get("conf")) >= SPRAY_CONF]
 
 
+def _minutes_since(v) -> float | None:
+    """距给定 ISO 时间已过分钟数；无记录/解析失败返回 None（视为无冷却）。"""
+    if not v:
+        return None
+    try:
+        last = datetime.fromisoformat(str(v))
+        return (datetime.now() - last).total_seconds() / 60.0
+    except (TypeError, ValueError):
+        return None
+
+
+def _spray_cooldown_remain(state: dict) -> float | None:
+    """若处于喷雾冷却期，返回剩余分钟数；否则返回 None。"""
+    gap = _minutes_since(state.get("last_spray_end_at"))
+    if gap is None or gap >= SPRAY_COOLDOWN_MIN:
+        return None
+    return SPRAY_COOLDOWN_MIN - gap
+
+
 def _irrigate_decision(soil: dict, daily: list[dict], valve_state: str) -> list[dict]:
     """浇水决策。"""
     actions: list[dict] = []
@@ -81,8 +102,12 @@ def _irrigate_decision(soil: dict, daily: list[dict], valve_state: str) -> list[
 
 
 def _spray_decision(detections: dict, daily: list[dict], now: dict,
-                    boom_state: str, counters: dict) -> list[dict]:
-    """打药/降温喷灌决策。counters: {"spray_hits", "spray_misses"} 跨轮次保持。"""
+                    boom_state: str, counters: dict, state: dict) -> list[dict]:
+    """打药/降温喷灌决策。counters: {"spray_hits", "spray_misses"} 跨轮次保持。
+
+    state 用于维护喷雾冷却：last_spray_end_at（上次喷雾结束时刻）与
+    spray_cooldown_hint（冷却期提示，供 summary 展示）。
+    """
     actions: list[dict] = []
     diseases = _diseases(detections)
     rainy = _max_precip(daily) >= RAIN_LIMIT_MM
@@ -101,7 +126,18 @@ def _spray_decision(detections: dict, daily: list[dict], now: dict,
                       else f"连续 {counters['spray_misses']} 次未检出病害")
             actions.append({"device": "spray_boom", "op": "off", "reason": f"停止喷药：{reason}"})
             counters["spray_misses"] = 0
+            # 记录喷雾结束时刻，进入冷却期（防止刚喷完又重复喷）
+            state["last_spray_end_at"] = datetime.now().isoformat(timespec="seconds")
     else:
+        cooldown = _spray_cooldown_remain(state)
+        if cooldown is not None:
+            # 冷却期内：不开启任何喷雾，连续检出计数清零（冷却结束后重新累计）
+            counters["spray_hits"] = 0
+            counters["spray_misses"] = 0
+            state["spray_cooldown_hint"] = (
+                f"喷雾冷却中：距上次喷完 {cooldown:.0f} 分钟，"
+                f"{SPRAY_COOLDOWN_MIN:.0f} 分钟内不重复喷药")
+            return actions
         if rainy or windy:
             counters["spray_hits"] = 0
             counters["spray_misses"] = 0
@@ -143,7 +179,8 @@ def decide(inputs: dict, state: dict | None = None) -> dict:
     actions: list[dict] = []
     actions += _irrigate_decision(soil, daily, valve_state)
     actions += _spray_decision(detections, daily, now, boom_state,
-                               state.setdefault("counters", {"spray_hits": 0, "spray_misses": 0}))
+                               state.setdefault("counters", {"spray_hits": 0, "spray_misses": 0}),
+                               state)
 
     # 决策类型与等级
     soil_v = _num(soil.get("value"))
@@ -170,6 +207,10 @@ def decide(inputs: dict, state: dict | None = None) -> dict:
     if detections.get("summary"):
         s = detections["summary"]
         parts.append(f"检出 {s['total']} 处" + (f"（病害: {'/'.join(s['diseases'])}）" if s["diseases"] else "（无病害）"))
+    # 喷雾冷却提示（冷却期抑制喷雾时由 _spray_decision 写入，仅当轮有效）
+    cooldown_hint = state.pop("spray_cooldown_hint", None)
+    if cooldown_hint:
+        parts.append(cooldown_hint)
     summary = "；".join(parts) if parts else "暂无有效输入"
 
     return {
