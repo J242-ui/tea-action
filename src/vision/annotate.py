@@ -37,11 +37,13 @@ def draw_detections(frame: np.ndarray, result: dict) -> np.ndarray:
     return out
 
 
-def frame_to_base64(frame: np.ndarray, quality: int = 82) -> str:
+def frame_to_base64(frame: np.ndarray, quality: int = 70) -> str:
     """BGR 帧 → data URL（供网页 <img> 直接显示）。
 
     优先 cv2 编码 JPEG；cv2 未安装时用纯 numpy+zlib 的 PNG 编码兜底，
     保证无 OpenCV 环境（依赖安装中）也能在网页展示画面。
+    quality 默认 70：持续录像高频推流时显著减小 payload 与浏览器解码开销；
+    静态检测帧（state_update）可传更高质量。
     """
     try:
         import cv2

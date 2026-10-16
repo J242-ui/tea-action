@@ -8,8 +8,6 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
-import threading
-import time
 from datetime import datetime
 
 import pandas as pd
@@ -19,11 +17,6 @@ import streamlit as st
 from src import config, db, ui
 
 WS_BASE = f"http://127.0.0.1:{os.getenv('AGENT_WS_PORT', '8510')}"
-
-# 实时画面缓存：后台 WS 订阅线程写入（方案 A），页面 fragment 读取渲染
-_FRAME_CACHE: dict = {}
-_FRAME_LOCK = threading.Lock()
-_WS_LISTENER: threading.Thread | None = None
 
 LEVEL_CN = {"low": "低", "medium": "中", "high": "高"}
 DECISION_CN = {
@@ -52,7 +45,11 @@ def ws_alive() -> bool:
         return False
 
 
-def _api(path: str, method: str = "GET", timeout: int = 30, data: dict | None = None):
+def _api(path: str, method: str = "GET", timeout: int = 5, data: dict | None = None):
+    """请求 WS 服务。默认 5 秒超时：8510 异常时页面快速降级提示，不干等。
+
+    整轮决策（/api/agent/step）可能包含首帧预热等耗时操作，调用方单独传较长超时。
+    """
     try:
         if method == "POST":
             if data is not None:
@@ -64,68 +61,23 @@ def _api(path: str, method: str = "GET", timeout: int = 30, data: dict | None = 
 
 
 def _ensure_ws_listener() -> bool:
-    """确保后台 WS 订阅线程运行（幂等）。
+    """（已弃用）主站实时画面改为每秒拉取 /api/frame，不再常驻 WS 订阅线程。
 
-    方案 A：页面内直接订阅 /ws，收到 stream_frame / state_update 帧后写入
-    _FRAME_CACHE；断线自动 2 秒重连。供「实时画面」fragment 渲染。
+    保留旧常驻线程会在 Streamlit 会话反复刷新时累积僵尸 WS 连接，
+    最终拖垮 WS 服务（clients 无限增长 → 广播变慢 → 服务崩溃）。
+    实时画面统一走方案 B：/api/frame 接口（服务端缓存最近一帧）。
     """
-    global _WS_LISTENER
-    if _WS_LISTENER is not None and _WS_LISTENER.is_alive():
-        return True
-    if not ws_alive():
-        return False
-
-    def _run() -> None:
-        import asyncio
-        import json as _json
-
-        import websockets
-        uri = f"ws://127.0.0.1:{os.getenv('AGENT_WS_PORT', '8510')}/ws"
-
-        async def _listen() -> None:
-            async with websockets.connect(uri) as ws:
-                while True:
-                    try:
-                        msg = _json.loads(await asyncio.wait_for(ws.recv(), timeout=5))
-                    except asyncio.TimeoutError:
-                        continue
-                    data = msg.get("data") or {}
-                    det = data.get("detections") or {}
-                    img = det.get("image")
-                    if img and msg.get("kind") in ("stream_frame", "state_update"):
-                        with _FRAME_LOCK:
-                            _FRAME_CACHE.update({
-                                "ts": data.get("ts"),
-                                "image": img,
-                                "source": det.get("source", "demo_frame"),
-                                "backend": det.get("backend", "sim"),
-                            })
-
-        while True:
-            try:
-                asyncio.run(_listen())
-            except Exception:  # noqa: BLE001 - 断线重连
-                time.sleep(2)
-
-    _WS_LISTENER = threading.Thread(target=_run, daemon=True, name="page-ws-frame-listener")
-    _WS_LISTENER.start()
-    return True
+    return ws_alive()
 
 
 def _render_live_frame() -> None:
     """实时画面片段（fragment，约 1 秒自动刷新）。
 
-    优先读 WebSocket 订阅缓存帧（方案 A）；缓存无帧时拉取 /api/frame 兜底（方案 B）。
+    直接拉取服务端最近一帧缓存（/api/frame，由 Agent 持续录像/整轮决策更新），
+    本地每秒一次 50KB 级请求开销可忽略，且无连接泄漏风险。
     """
-    with _FRAME_LOCK:
-        cache = dict(_FRAME_CACHE)
-    img, src, ts = None, "demo_frame", ""
-    if cache.get("image"):
-        img, src, ts = cache["image"], cache.get("source", "demo_frame"), cache.get("ts", "")
-    else:
-        f = _api("/api/frame", timeout=3)
-        if f.get("image"):
-            img, src, ts = f["image"], f.get("source", "demo_frame"), f.get("ts", "")
+    f = _api("/api/frame", timeout=3)
+    img, src, ts = f.get("image"), f.get("source", "demo_frame"), f.get("ts", "")
     if img:
         st.image(img, use_container_width=True)
         src_txt = "USB摄像头实拍" if src == "usb_cam" else "演示帧（摄像头不可用）"
@@ -183,7 +135,7 @@ def main() -> None:
             r = _api("/api/agent/stop", "POST")
             st.toast("Agent 已停止" if r.get("ok") else f"停止失败：{r.get('message')}")
         if alive and st.button("⚡ 立即执行一步", width="stretch"):
-            _api("/api/agent/step", "POST")
+            _api("/api/agent/step", "POST", timeout=30)
             st.rerun()
 
     if not alive:
@@ -227,10 +179,10 @@ def main() -> None:
         live_on = st.toggle("📹 实时画面", value=st.session_state.get("live_on", True),
                             key="live_on")
     with t2:
-        st.caption("开启后本页画面实时刷新（约 1 秒/帧）：优先走 WebSocket 推送帧（A），"
-                   "不可用时自动拉取 /api/frame 兜底（B）。")
+        st.caption("开启后本页画面实时刷新（约 1 秒/帧）：拉取服务端最近一帧缓存，"
+                   "不占用 WebSocket 长连接（稳定、无泄漏）。")
     if live_on:
-        _ensure_ws_listener()
+        pass  # 实时画面由下方 fragment 每秒拉取 /api/frame 实现
 
     col_left, col_right = st.columns([3, 2])
 

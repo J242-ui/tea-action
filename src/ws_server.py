@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import time
 from pathlib import Path
 
 from . import db
@@ -42,6 +43,7 @@ class TeaAgentASGI:
     def __init__(self):
         self.clients: list = []
         self.loop: asyncio.AbstractEventLoop | None = None
+        self._reaper_task: asyncio.Task | None = None
 
     # ---------- ASGI 入口 ----------
     async def __call__(self, scope, receive, send):
@@ -58,11 +60,33 @@ class TeaAgentASGI:
             if msg["type"] == "lifespan.startup":
                 self.loop = asyncio.get_running_loop()
                 runner.subscribe(self._broadcast)
+                # 僵尸连接清理任务：无心跳超过 60 秒的 WS 客户端直接踢出，
+                # 防止主站页面反复刷新/会话残留导致 clients 无限累积、广播变慢。
+                # 必须保存任务引用，否则会被事件循环垃圾回收导致清理永不运行
+                self._reaper_task = asyncio.create_task(self._reap_stale_clients())
                 await send({"type": "lifespan.startup.complete"})
             elif msg["type"] == "lifespan.shutdown":
+                if self._reaper_task is not None:
+                    self._reaper_task.cancel()
                 runner.stop()
                 await send({"type": "lifespan.shutdown.complete"})
                 return
+
+    async def _reap_stale_clients(self) -> None:
+        """周期扫描：剔除 last_seen 超过 60 秒的僵尸 WS 连接。"""
+        while True:
+            await asyncio.sleep(15)
+            now = time.monotonic()
+            for ws in list(self.clients):
+                if now - ws.get("last_seen", now) > 60:
+                    try:
+                        await ws["send"]({"type": "websocket.close", "code": 4000})
+                    except Exception:  # noqa: BLE001
+                        pass
+                    try:
+                        self.clients.remove(ws)
+                    except ValueError:
+                        pass
 
     # ---------- 跨线程广播 ----------
     def _broadcast(self, event: dict) -> None:
@@ -74,7 +98,9 @@ class TeaAgentASGI:
         async def _send_all():
             for ws in list(self.clients):
                 try:
-                    await ws["send"]({"type": "websocket.send", "text": payload})
+                    # 限时发送：慢/死连接不阻塞事件循环（取消后该连接视为失效移除）
+                    await asyncio.wait_for(
+                        ws["send"]({"type": "websocket.send", "text": payload}), timeout=0.5)
                 except Exception:  # noqa: BLE001
                     try:
                         self.clients.remove(ws)
@@ -167,7 +193,7 @@ class TeaAgentASGI:
     # ---------- WebSocket ----------
     async def _websocket(self, scope, receive, send):
         await send({"type": "websocket.accept"})
-        conn = {"send": send}
+        conn = {"send": send, "last_seen": time.monotonic()}
         self.clients.append(conn)
         try:
             if runner.latest:
@@ -178,7 +204,8 @@ class TeaAgentASGI:
                 msg = await receive()
                 if msg["type"] == "websocket.disconnect":
                     break
-                # 客户端心跳消息：目前仅用于保活
+                # 客户端心跳/消息：更新存活时间，供僵尸连接清理任务判定
+                conn["last_seen"] = time.monotonic()
         except Exception:  # noqa: BLE001
             pass
         finally:

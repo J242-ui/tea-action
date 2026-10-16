@@ -95,9 +95,11 @@ class AgentRunner:
         while not self._stop_evt.is_set():
             try:
                 if self.refresh_mode == "stream":
-                    # 持续录像：高频推流画面帧；完整决策按间隔节流
+                    # 持续录像：高频推流画面帧；完整决策按间隔节流。
+                    # tick 间隔 0.5s（约 2fps）：视觉上已如监控般流畅；
+                    # 更低（如 0.2s）会让浏览器每帧解码大图、DOM 重建，CPU 高反而更卡
                     self._stream_tick()
-                    self._stop_evt.wait(0.2)
+                    self._stop_evt.wait(0.5)
                     if time.monotonic() - self._last_full >= self.interval:
                         self._last_full = time.monotonic()
                         self.step()
