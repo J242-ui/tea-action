@@ -32,6 +32,10 @@ CLASS_NAMES = [
     "Tea Mosquito bug", "Healthy", "White spot", "disease",
 ]
 
+# 推理输入分辨率：默认 320 以降低轻薄本 CPU 负载（首次调用含 torch 预热约数秒，
+# 稳态推理约 50ms/帧，几乎不影响帧率）；可通过环境变量 DETECT_IMGSZ 调整（如 480/640）。
+DETECT_IMGSZ = int(os.getenv("DETECT_IMGSZ", "320"))
+
 # 模拟模式下各叶片的检出类别（与合成帧病斑对应）
 _SIM_LEAF_CLASS = {
     "brown": "Brown blight",
@@ -162,7 +166,8 @@ class TeaDiseaseDetector:
         return self._sim.detect(frame)
 
     def _detect_real(self, frame: np.ndarray, source_hint: str | None = None) -> dict:
-        results = self.model.predict(frame, conf=0.25, iou=0.5, verbose=False)
+        results = self.model.predict(frame, conf=0.25, iou=0.5, verbose=False,
+                                     imgsz=DETECT_IMGSZ)
         detections = []
         names = self.model.names if hasattr(self.model, "names") else CLASS_NAMES
         r = results[0]

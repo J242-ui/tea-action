@@ -32,6 +32,10 @@ DB_CONFIG = dict(
     database=_cfg("DB_NAME", "tea_garden"),
     charset="utf8mb4",
     cursorclass=DictCursor,
+    # 快速失败：数据库不可达/慢时不阻塞 Agent 主循环（连接/读写均短超时）
+    connect_timeout=2,
+    read_timeout=3,
+    write_timeout=3,
 )
 
 _SCHEMA = """

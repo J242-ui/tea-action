@@ -146,7 +146,9 @@ class TeaAgentASGI:
             elif method == "POST" and path == "/api/agent/stop":
                 body = _json_body({"ok": runner.stop(), "running": runner.running})
             elif method == "POST" and path == "/api/agent/step":
-                snapshot = runner.step()
+                # 整轮决策（摄像头/推理/写库）可能耗时数秒，必须在线程池执行，
+                # 否则会阻塞 uvicorn 事件循环，导致网页/WS/其他接口全部卡住
+                snapshot = await asyncio.to_thread(runner.step)
                 body = _json_body({"ok": True, "snapshot": snapshot})
             else:
                 status = 404
