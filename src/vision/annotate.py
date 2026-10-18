@@ -55,6 +55,46 @@ def frame_to_base64(frame: np.ndarray, quality: int = 70) -> str:
     return _png_b64(frame)
 
 
+def _resize_thumb(frame: np.ndarray, max_w: int = 320) -> np.ndarray:
+    """等比缩放到 max_w 宽（默认 320）的预览缩略图。
+
+    持续录像高频推流用：单路 payload 从 20-50KB 降到 5-10KB，
+    浏览器每 0.5s 解码 N 路大图的 CPU 压力显著下降（多路时线性收益更明显）。
+    """
+    h, w = frame.shape[:2]
+    if w <= max_w:
+        return frame
+    try:
+        import cv2
+        nw = max_w
+        nh = max(1, int(round(h * max_w / w)))
+        return cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_AREA)
+    except Exception:  # noqa: BLE001
+        # 无 cv2 时做简单隔行抽稀，保持形状
+        step = max(1, int(np.ceil(w / max_w)))
+        return frame[::step, ::step]
+
+
+def frame_to_base64_thumb(frame: np.ndarray, max_w: int = 320, quality: int = 60) -> str:
+    """标注帧 → 缩略图 data URL（推流/监控台预览用，体积小解码快）。"""
+    return frame_to_base64(_resize_thumb(frame, max_w), quality=quality)
+
+
+def frame_to_jpeg_bytes(frame: np.ndarray, quality: int = 80) -> bytes:
+    """BGR 帧 → JPEG bytes（供每日预警帧文件等本地落盘用，保留原分辨率）。"""
+    try:
+        import cv2
+        ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
+        if ok:
+            return buf.tobytes()
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        return base64.b64decode(_png_b64(frame).split(",", 1)[1])
+    except Exception:  # noqa: BLE001
+        return b""
+
+
 def _png_b64(frame: np.ndarray) -> str:
     """纯 Python PNG 编码（无依赖），BGR → RGB。"""
     try:

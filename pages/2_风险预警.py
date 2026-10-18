@@ -29,6 +29,52 @@ overall = engine.assess_all(now, daily)
 
 ui.overall_risk_banner(overall)
 
+# ===== 📹 摄像头监测预警（每日推送一次：拍摄画面 + 病虫害情况 + 处理情况）=====
+with st.expander("📹 摄像头监测预警（每日推送）", expanded=True):
+    st.caption("基于多路摄像头实时监测：每天推送一次茶园视频监测日报（拍摄画面 + 病虫害检出 + Agent 处理情况）。")
+    latest_alert = db.latest_camera_alert(garden.get("key", garden.get("name", "")))
+    if latest_alert:
+        _a = latest_alert
+        _ac = ui.LEVEL_COLOR.get(_a.get("level", "low"), "#888")
+        _al = ui.LEVEL_CN.get(_a.get("level", "low"), _a.get("level", ""))
+        c_img, c_txt = st.columns([1, 2])
+        with c_img:
+            if _a.get("image_base64"):
+                import base64 as _b64
+                try:
+                    st.image(_b64.b64decode(_a["image_base64"]), caption=f"拍摄画面 · {_a.get('alert_date', '')}",
+                             width="stretch")
+                except Exception:
+                    st.caption("（画面解码失败）")
+            else:
+                st.caption("（当日无可用拍摄画面）")
+        with c_txt:
+            st.markdown(f"<span style='background:{_ac};color:#fff;border-radius:4px;padding:2px 8px;"
+                        f"font-size:13px'>{_al}</span> &nbsp; **{_a.get('title', '')}**",
+                        unsafe_allow_html=True)
+            st.markdown(_a.get("content", ""))
+            st.markdown(f"**🤖 处理情况：** {_a.get('actions_text', '')}")
+            st.caption(f"推送时间 {_a.get('created_at', '')}")
+    else:
+        st.info("暂无摄像头监测预警：Agent 运行后每天固定时间自动推送一次（默认 09:00，可用 ALERT_DAILY_TIME 配置）。")
+
+    _hist = db.camera_alert_history(garden.get("key", garden.get("name", "")), limit=15)
+    if _hist:
+        with st.expander(f"📋 摄像头监测预警历史（最近 {len(_hist)} 条）", expanded=False):
+            for _r in _hist:
+                _hc = ui.LEVEL_COLOR.get(_r.get("level", "low"), "#888")
+                st.markdown(
+                    f"<span style='color:{_hc};font-weight:700'>{ui.LEVEL_CN.get(_r.get('level','low'),'')}</span> · "
+                    f"<b>{_r.get('alert_date','')}</b> · {_r.get('title','')}",
+                    unsafe_allow_html=True,
+                )
+                st.caption(_r.get("content", ""))
+                if _r.get("actions_text"):
+                    st.caption("🤖 处理情况：" + _r["actions_text"])
+                st.divider()
+    else:
+        st.caption("暂无历史预警记录。")
+
 # ===== 智能融合研判（ML 分类 + 时序 + Bandit 择优）=====
 from src import ensemble
 _ens = None

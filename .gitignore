@@ -32,6 +32,9 @@ st_err.txt
 ws_server.log
 ws_server.err.log
 
+# 每日预警运行时产物（由 daily_recorder 自动生成，不入库）
+data/alerts/
+
 # 数据集（786MB 且超出 GitHub 单文件 100MB 上限，用 download_data.py 重新下载）
 training/datasets/
 

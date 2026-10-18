@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>茶园智能执行 · 动态展示</title>
+<title>茶园智能执行 · 监控台</title>
 <style>
   :root {
     --bg: #0f2418;
@@ -26,9 +26,9 @@
     min-height: 100vh;
     padding: 18px 22px 40px;
   }
-  header { display: flex; align-items: center; gap: 14px; margin-bottom: 18px; flex-wrap: wrap; }
-  header h1 { font-size: 22px; letter-spacing: 1px; }
-  header .sub { color: var(--dim); font-size: 13px; }
+  header { display: flex; align-items: center; gap: 12px; margin-bottom: 16px; flex-wrap: wrap; }
+  header h1 { font-size: 21px; letter-spacing: 1px; }
+  header .sub { color: var(--dim); font-size: 12px; }
   .status-pill {
     display: inline-flex; align-items: center; gap: 7px;
     padding: 5px 14px; border-radius: 999px; font-size: 13px; font-weight: 600;
@@ -38,26 +38,107 @@
   .status-pill.running .dot { background: var(--green); box-shadow: 0 0 10px var(--green); }
   .status-pill.stopped .dot { background: var(--dim); }
   .status-pill.error .dot { background: var(--red); }
-  .grid {
-    display: grid; gap: 16px;
-    grid-template-columns: minmax(300px, 1.25fr) minmax(260px, 1fr) minmax(300px, 1fr);
+  /* ---- 顶部工具条（监控台添加摄像头） ---- */
+  .toolbar {
+    display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+    padding: 10px 14px; border: 1px solid var(--line); border-radius: 12px;
+    background: var(--card); margin-bottom: 16px;
   }
+  .toolbar .tb-label { font-size: 13px; color: var(--dim); font-weight: 600; margin-right: 2px; }
+  .toolbar select, .toolbar input {
+    background: var(--card2); border: 1px solid var(--line); color: var(--text);
+    border-radius: 8px; padding: 7px 10px; font-size: 13px; outline: none;
+  }
+  .toolbar select { cursor: pointer; }
+  .toolbar input::placeholder { color: var(--dim); }
+  .toolbar input.src { width: 300px; }
+  .toolbar input.name { width: 150px; }
+  .toolbar button {
+    background: var(--green); border: none; color: #06230f; font-weight: 700;
+    padding: 7px 16px; border-radius: 8px; cursor: pointer; font-size: 13px;
+  }
+  .toolbar button:hover { filter: brightness(1.1); }
+  .toolbar button.ghost {
+    background: var(--card2); color: var(--dim); border: 1px solid var(--line); font-weight: 600;
+  }
+  .tb-hint { font-size: 11px; color: var(--dim); }
   .card {
     background: linear-gradient(180deg, var(--card) 0%, var(--card2) 100%);
     border: 1px solid var(--line); border-radius: 14px; padding: 14px 16px;
   }
-  .card h2 { font-size: 14px; color: var(--dim); font-weight: 600; margin-bottom: 10px; display:flex; align-items:center; gap:8px;}
+  .card h2 { font-size: 14px; color: var(--dim); font-weight: 600; margin-bottom: 12px; display:flex; align-items:center; gap:8px;}
   .card h2 .tag { margin-left: auto; font-size: 11px; padding: 2px 8px; border-radius: 8px; background: var(--card2); border:1px solid var(--line); color: var(--dim);}
-  /* ---- 摄像头 ---- */
-  .camera-wrap { position: relative; border-radius: 10px; overflow: hidden; background:#000; border:1px solid var(--line);}
-  .camera-wrap img { width: 100%; display: block; min-height: 220px; object-fit: cover; }
-  .cam-badge { position: absolute; top: 8px; left: 8px; font-size: 11px; padding: 3px 9px; border-radius: 8px; background: rgba(0,0,0,.6); color: var(--cyan); }
-  .det-list { margin-top: 10px; display: flex; flex-wrap: wrap; gap: 6px; }
+  /* ---- 摄像头监控网格（监控台） ---- */
+  .cam-grid {
+    display: grid; gap: 12px;
+    grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+  }
+  .cam-grid.single { grid-template-columns: minmax(360px, 720px); }
+  .cam-card {
+    border: 1px solid var(--line); border-radius: 12px; overflow: hidden;
+    background: #08130c;
+  }
+  .cam-card .cam-wrap { position: relative; background: #000; }
+  .cam-card img { width: 100%; display: block; min-height: 180px; object-fit: cover; transition: opacity .4s; }
+  .cam-card img.offline { opacity: .45; }
+  .cam-badge {
+    position: absolute; top: 8px; left: 8px; font-size: 11px; padding: 3px 9px;
+    border-radius: 8px; background: rgba(0,0,0,.62); color: var(--cyan); font-weight: 600;
+  }
+  .cam-src {
+    position: absolute; top: 8px; left: 8px; font-size: 10px; padding: 2px 8px;
+    border-radius: 8px; background: rgba(0,0,0,.5); color: var(--dim);
+    max-width: 55%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .cam-badge + .cam-src { left: auto; right: 8px; }
+  .cam-ts {
+    position: absolute; bottom: 8px; right: 8px; font-size: 10px; padding: 2px 7px;
+    border-radius: 6px; background: rgba(0,0,0,.55); color: var(--dim); font-variant-numeric: tabular-nums;
+  }
+  .cam-del {
+    position: absolute; top: 8px; right: 8px; width: 24px; height: 24px; border-radius: 7px;
+    border: none; background: rgba(229,83,61,.85); color: #fff; font-size: 12px;
+    cursor: pointer; line-height: 1; opacity: 0; transition: opacity .2s;
+  }
+  .cam-card:hover .cam-del { opacity: 1; }
+  .cam-body { padding: 8px 10px 10px; }
+  .cam-name { font-size: 13px; font-weight: 600; color: var(--text); }
+  .cam-name .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--dim); margin-right: 6px; }
+  .cam-name .dot.on { background: var(--green); box-shadow: 0 0 6px var(--green); }
+  .cam-name .dot.off { background: var(--red); }
+  .cam-empty {
+    display: flex; align-items: center; justify-content: center; min-height: 180px;
+    color: var(--dim); font-size: 13px; flex-direction: column; gap: 8px;
+  }
+  /* ---- 摄像头监测预警（每日推送） ---- */
+  .alert-card { margin-top: 16px; border: 1px solid var(--line); border-radius: 14px; overflow: hidden; }
+  .alert-card .head {
+    display: flex; align-items: center; gap: 10px; padding: 10px 16px;
+    background: var(--card); border-bottom: 1px solid var(--line); font-weight: 700; font-size: 14px;
+  }
+  .alert-card .head .pill {
+    margin-left: auto; font-size: 11px; padding: 2px 10px; border-radius: 999px; font-weight: 600;
+  }
+  .alert-card .head .pill.high { background: rgba(229,83,61,.18); color: #ffb3a6; border: 1px solid var(--red); }
+  .alert-card .head .pill.medium { background: rgba(240,180,41,.15); color: #ffd98a; border: 1px solid var(--amber); }
+  .alert-card .head .pill.low { background: rgba(62,207,122,.14); color: #a8f0c5; border: 1px solid var(--green); }
+  .alert-card .body { display: flex; gap: 14px; padding: 12px 16px; background: var(--card2); }
+  .alert-card .body img { width: 180px; max-height: 120px; object-fit: cover; border-radius: 8px; border: 1px solid var(--line); }
+  .alert-card .body .txt { flex: 1; font-size: 13px; line-height: 1.7; }
+  .alert-card .body .txt .acts { margin-top: 6px; font-size: 12px; color: var(--dim); }
+  .alert-card .body .txt .acts b { color: var(--cyan); }
+  .alert-card .empty { padding: 12px 16px; background: var(--card2); font-size: 12px; }
+  .det-list { margin-top: 6px; display: flex; flex-wrap: wrap; gap: 6px; min-height: 4px; }
   .det { font-size: 11px; padding: 3px 9px; border-radius: 999px; border: 1px solid var(--line); background: var(--card2); }
   .det.disease { border-color: var(--red); color: #ffb3a6; }
   .det.healthy { border-color: var(--green); color: #a8f0c5; }
-  .summary-line { margin-top: 8px; font-size: 12px; color: var(--dim); }
-  /* ---- 土壤仪表 ---- */
+  .summary-line { margin-top: 6px; font-size: 11px; color: var(--dim); }
+  /* ---- 下方信息区 ---- */
+  .grid-info {
+    display: grid; gap: 16px; margin-top: 16px;
+    grid-template-columns: minmax(300px, 1.1fr) minmax(280px, 1fr) minmax(300px, 1fr);
+  }
+  /* ---- 土壤监控台 ---- */
   .gauge-wrap { display: flex; align-items: center; gap: 14px; }
   .gauge-val { font-size: 40px; font-weight: 700; line-height: 1; }
   .gauge-val small { font-size: 14px; color: var(--dim); font-weight: 400; }
@@ -65,6 +146,9 @@
   .soil-bar { margin-top: 12px; height: 10px; border-radius: 6px; background: var(--card2); border:1px solid var(--line); position: relative; overflow: hidden;}
   .soil-bar .fill { height: 100%; border-radius: 6px; transition: width .6s ease, background .6s ease; }
   .soil-marks { display: flex; justify-content: space-between; font-size: 10px; color: var(--dim); margin-top: 4px; }
+  .spark-wrap { margin-top: 12px; }
+  .spark-title { font-size: 11px; color: var(--dim); margin-bottom: 4px; display: flex; justify-content: space-between; }
+  .spark-wrap svg { width: 100%; height: 52px; display: block; background: rgba(0,0,0,.25); border-radius: 8px; }
   /* ---- 决策面板 ---- */
   .decision-type { font-size: 20px; font-weight: 700; margin: 2px 0 8px; }
   .decision-summary { font-size: 12px; color: var(--dim); line-height: 1.6; }
@@ -100,33 +184,63 @@
   .valve-open-anim { animation: valvestroke .4s ease; }
   @keyframes valvestroke { 0% { transform: scaleY(1);} 50% { transform: scaleY(1.25);} 100% { transform: scaleY(1);} }
   footer { margin-top: 18px; color: var(--dim); font-size: 12px; text-align: center; }
-  @media (max-width: 1100px) { .grid { grid-template-columns: 1fr; } }
+  @media (max-width: 1100px) { .grid-info { grid-template-columns: 1fr; } }
 </style>
 </head>
 <body>
 <header>
-  <h1>🍵 茶园智能执行 · 实时状态</h1>
-  <span class="sub">USB摄像头 → YOLO推理 → Agent决策 → WebSocket推送 → 动态展示</span>
+  <h1>🍵 茶园智能执行 · 监控台</h1>
+  <span class="sub">多路摄像头 → YOLO推理 → Agent决策 → WebSocket推送 → 实时监控</span>
   <span id="agentPill" class="status-pill stopped"><span class="dot"></span><span id="agentPillText">服务未连接</span></span>
   <span id="stepPill" class="status-pill"><span class="dot"></span>决策轮次 <b id="steps">0</b></span>
   <span id="camPill" class="status-pill"><span class="dot"></span><span id="camPillText">摄像头…</span></span>
 </header>
 
-<div class="grid">
-  <!-- 左：摄像头 + 检测 -->
-  <section class="card">
-    <h2>📷 视觉检测 <span class="tag" id="modelTag">模型加载中…</span></h2>
-    <div class="camera-wrap">
-      <img id="camImg" alt="摄像头画面" src="">
-      <span class="cam-badge" id="camBadge">演示帧</span>
-    </div>
-    <div class="det-list" id="detList"></div>
-    <div class="summary-line" id="detSummary">等待 Agent 推送…</div>
-  </section>
+<!-- 顶部工具条：添加/管理摄像头源（监控台） -->
+<div class="toolbar">
+  <span class="tb-label">＋ 添加摄像头</span>
+  <select id="newType">
+    <option value="usb">USB 摄像头</option>
+    <option value="rtsp">网络摄像头 (RTSP)</option>
+    <option value="http">MJPEG/HTTP 流</option>
+  </select>
+  <input id="newSource" class="src" placeholder="设备号 0 / rtsp://user:pwd@ip:554/... / http://ip:8080/video">
+  <input id="newName" class="name" placeholder="名称（可选）">
+  <button onclick="addCam()">添加</button>
+  <button class="ghost" onclick="loadCams()">刷新列表</button>
+  <span class="tb-hint">默认已注册 USB 摄像头 (usb:0)，可随时添加 RTSP/HTTP 网络摄像头</span>
+</div>
 
-  <!-- 中：土壤湿度 + 决策 -->
+<!-- 摄像头监控网格 -->
+<section class="card">
+  <h2>📷 摄像头监控 <span class="tag" id="camCountText">…</span></h2>
+  <div class="cam-grid" id="camGrid"></div>
+</section>
+
+<!-- 摄像头监测预警（每日推送一次） -->
+<div class="alert-card" id="alertCard" style="display:none">
+  <div class="head">
+    <span>🚨 摄像头监测预警（每日推送）</span>
+    <span class="pill low" id="alertPill">--</span>
+  </div>
+  <div class="body">
+    <img id="alertImg" alt="拍摄画面">
+    <div class="txt">
+      <div id="alertTitle" style="font-weight:600"></div>
+      <div id="alertContent"></div>
+      <div class="acts"><b>🤖 处理情况：</b><span id="alertActs"></span></div>
+      <div style="margin-top:4px;font-size:11px;color:var(--dim)" id="alertTime"></div>
+    </div>
+  </div>
+</div>
+<div class="alert-card" id="alertEmpty" style="display:none">
+  <div class="empty">暂无摄像头监测预警：Agent 运行后每天固定时间自动推送一次（默认 09:00，可用 ALERT_DAILY_TIME 配置）。</div>
+</div>
+
+<div class="grid-info">
+  <!-- 左：土壤湿度监控台 -->
   <section class="card">
-    <h2>🌱 土壤湿度传感器</h2>
+    <h2>🌱 土壤湿度监控 <span class="tag">实时 + 60点趋势</span></h2>
     <div class="gauge-wrap">
       <svg width="96" height="96" viewBox="0 0 100 100">
         <circle cx="50" cy="50" r="40" fill="none" stroke="#24402f" stroke-width="9" stroke-linecap="round"/>
@@ -143,8 +257,15 @@
     </div>
     <div class="soil-bar"><div class="fill" id="soilBar" style="width:0%"></div></div>
     <div class="soil-marks"><span>0</span><span>45 缺水</span><span>60~80 适宜</span><span>100%</span></div>
+    <div class="spark-wrap">
+      <div class="spark-title"><span>湿度趋势（最近 60 条）</span><span id="sparkRange"></span></div>
+      <svg id="soilSpark" preserveAspectRatio="none"></svg>
+    </div>
+  </section>
 
-    <h2 style="margin-top:16px">🤖 Agent 决策</h2>
+  <!-- 中：Agent 决策 -->
+  <section class="card">
+    <h2>🤖 Agent 决策 <span class="tag" id="modelTag">模型加载中…</span></h2>
     <div id="decisionType" class="decision-type">--</div>
     <div id="decisionSummary" class="decision-summary">等待决策…</div>
     <div id="decisionExplain" class="decision-explain" style="display:none"></div>
@@ -159,19 +280,12 @@
     <div class="act-row">
       <div class="act-icon">
         <svg viewBox="0 0 120 120" width="66" height="66">
-          <!-- 主管道 -->
           <line x1="8" y1="30" x2="112" y2="30" stroke="#5c7a68" stroke-width="10" stroke-linecap="round"/>
-          <!-- 水源 -->
           <circle cx="14" cy="30" r="7" fill="#38d6c4"/>
-          <!-- 阀门主体 -->
           <rect x="52" y="16" width="16" height="28" rx="4" fill="#3a5a48" stroke="#6d9379" stroke-width="2"/>
-          <!-- 阀门手柄 -->
           <line id="valveHandle" x1="60" y1="30" x2="88" y2="14" stroke="#f0b429" stroke-width="5" stroke-linecap="round"/>
-          <!-- 滴灌支管 -->
           <path id="dripPipe" d="M60 30 L60 78" stroke="#4a7a5e" stroke-width="5" fill="none" stroke-dasharray="6 6" class="flow" style="opacity:.25"/>
-          <!-- 滴头 -->
           <circle id="dripHead" cx="60" cy="84" r="5" fill="#38d6c4"/>
-          <!-- 水滴 -->
           <g id="drops" style="opacity:0">
             <circle class="drop" cx="60" cy="90" r="3" fill="#38d6c4" style="--dx:-10px; --dy:26px; animation-delay:0s"/>
             <circle class="drop" cx="60" cy="90" r="3" fill="#38d6c4" style="--dx:8px; --dy:30px; animation-delay:.35s"/>
@@ -189,16 +303,12 @@
     <div class="act-row">
       <div class="act-icon">
         <svg viewBox="0 0 120 120" width="66" height="66">
-          <!-- 立柱 -->
           <line x1="60" y1="112" x2="60" y2="52" stroke="#5c7a68" stroke-width="7" stroke-linecap="round"/>
-          <!-- 喷杆横梁 -->
           <g id="boomGroup">
             <line x1="18" y1="42" x2="102" y2="42" stroke="#6d9379" stroke-width="6" stroke-linecap="round"/>
-            <!-- 喷头 -->
             <circle cx="30" cy="42" r="6" fill="#3a5a48" stroke="#6d9379" stroke-width="2"/>
             <circle cx="60" cy="42" r="6" fill="#3a5a48" stroke="#6d9379" stroke-width="2"/>
             <circle cx="90" cy="42" r="6" fill="#3a5a48" stroke="#6d9379" stroke-width="2"/>
-            <!-- 喷雾 -->
             <g id="sprayGroup" style="opacity:0">
               <circle class="drop" cx="30" cy="42" r="3" fill="#bfe9ff" style="--dx:-16px; --dy:-24px; animation-delay:0s"/>
               <circle class="drop" cx="30" cy="42" r="3" fill="#bfe9ff" style="--dx:14px; --dy:-26px; animation-delay:.2s"/>
@@ -222,7 +332,7 @@
   </section>
 </div>
 
-<footer>茶园智能执行演示 · WebSocket 实时推送 · 全部软件模拟（摄像头可真实接入）</footer>
+<footer>茶园智能执行演示 · 多路摄像头监控台 · WebSocket 实时推送 · 摄像头不可用时自动降级演示帧</footer>
 
 <script>
 const DECISION_CN = {
@@ -240,6 +350,155 @@ function soilStyle(v, valveOpen) {
   return { color: "var(--blue)", label: "过湿 · 停止灌溉", bar: "var(--blue)" };
 }
 
+// ================= 摄像头监控网格 =================
+const camCards = {};  // cam_id -> DOM 引用
+
+function ensureCamCard(c) {
+  if (camCards[c.cam_id]) return camCards[c.cam_id];
+  const card = document.createElement("div");
+  card.className = "cam-card";
+  card.dataset.id = c.cam_id;
+  card.innerHTML = `
+    <div class="cam-wrap">
+      <div class="cam-empty">📷 等待画面…</div>
+      <img style="display:none" alt="摄像头画面">
+      <span class="cam-badge"></span>
+      <span class="cam-src"></span>
+      <span class="cam-ts">--:--:--</span>
+      <button class="cam-del" title="删除此摄像头">✕</button>
+    </div>
+    <div class="cam-body">
+      <div class="cam-name"><span class="dot"></span><span class="nm"></span></div>
+      <div class="det-list"></div>
+      <div class="summary-line"></div>
+    </div>`;
+  card.querySelector(".cam-del").onclick = () => removeCam(c.cam_id);
+  $("camGrid").appendChild(card);
+  const refs = {
+    card,
+    empty: card.querySelector(".cam-empty"),
+    img: card.querySelector("img"),
+    badge: card.querySelector(".cam-badge"),
+    src: card.querySelector(".cam-src"),
+    ts: card.querySelector(".cam-ts"),
+    dot: card.querySelector(".cam-name .dot"),
+    nm: card.querySelector(".cam-name .nm"),
+    dets: card.querySelector(".det-list"),
+    sm: card.querySelector(".summary-line"),
+  };
+  camCards[c.cam_id] = refs;
+  return refs;
+}
+
+function removeCamCard(camId) {
+  const refs = camCards[camId];
+  if (refs) { refs.card.remove(); delete camCards[camId]; }
+}
+
+function renderCams(cams) {
+  const ids = new Set((cams || []).map(c => c.cam_id));
+  Object.keys(camCards).forEach(id => { if (!ids.has(id)) removeCamCard(id); });
+  (cams || []).forEach(c => {
+    const refs = ensureCamCard(c);
+    const online = !!c.available || !!c.image;
+    refs.nm.textContent = c.name || c.cam_id;
+    refs.dot.className = "dot " + (online ? "on" : "off");
+    refs.badge.textContent = c.last_source === "net_cam" ? "网络摄像头"
+      : c.last_source === "usb_cam" ? "USB实拍" : "演示帧";
+    refs.src.textContent = c.source || "";
+    refs.ts.textContent = (c.ts || "").slice(11, 19);
+    if (c.image) {
+      refs.img.src = c.image;
+      refs.img.style.display = "block";
+      refs.empty.style.display = "none";
+      refs.img.className = online ? "" : "offline";
+    }
+    // 检测列表
+    refs.dets.innerHTML = "";
+    (c.detections || []).forEach(d => {
+      const el = document.createElement("span");
+      el.className = "det " + (d["class"] === "Healthy" ? "healthy" : "disease");
+      el.textContent = `${d["class"]} ${(d.conf * 100).toFixed(0)}%`;
+      refs.dets.appendChild(el);
+    });
+    const sm = c.summary || {};
+    refs.sm.textContent = sm.total !== undefined
+      ? `共检出 ${sm.total} 处 · ${sm.diseases && sm.diseases.length ? "病害: " + sm.diseases.join("、") : "无病害"}`
+      : "等待检测…";
+  });
+  const n = (cams || []).length;
+  $("camCountText").textContent = n + " 路画面";
+  $("camPillText").textContent = n ? `${n} 路源` : "无源";
+  $("camGrid").className = "cam-grid" + (n === 1 ? " single" : "");
+  if (!n) {
+    $("camGrid").innerHTML = "";
+    Object.keys(camCards).forEach(k => delete camCards[k]);
+    const empty = document.createElement("div");
+    empty.className = "cam-empty";
+    empty.style.gridColumn = "1 / -1";
+    empty.textContent = "暂无摄像头源，请在上方工具条添加";
+    $("camGrid").appendChild(empty);
+  }
+}
+
+// 从快照兼容旧结构（服务端升级前的 state_update）
+function camsFromSnapshot(s) {
+  if (s.cams && s.cams.length) return s.cams;
+  if (s.detections && s.detections.image) {
+    return [{
+      cam_id: "cam1", name: "摄像头", source: s.detections.source || "",
+      last_source: s.detections.source || "demo_frame", ts: s.ts,
+      image: s.detections.image, detections: s.detections.detections || [],
+      summary: s.detections.summary || {}, available: true,
+    }];
+  }
+  return [];
+}
+
+// ================= 土壤趋势图 =================
+function drawSoilSpark(hist) {
+  const svg = $("soilSpark");
+  const vals = (hist || []).map(h => (h && typeof h.value === "number") ? h.value : null).filter(v => v !== null);
+  $("sparkRange").textContent = hist && hist.length ? `${hist[0].created_at || ""} ~ ${hist[hist.length-1].created_at || ""}` : "";
+  if (vals.length < 2) {
+    svg.innerHTML = `<text x="8" y="20" fill="#9db8a8" font-size="11">暂无历史数据（Agent 运行后自动采集）</text>`;
+    return;
+  }
+  const W = 560, H = 52, padL = 4, padR = 4, padT = 4, padB = 4;
+  const mn = Math.min(45, ...vals), mx = Math.max(80, ...vals);
+  const span = (mx - mn) || 1;
+  const x = i => padL + (i * (W - padL - padR) / (vals.length - 1));
+  const y = v => padT + (1 - (v - mn) / span) * (H - padT - padB);
+  const pts = vals.map((v, i) => `${x(i).toFixed(1)},${y(v).toFixed(1)}`).join(" ");
+  // 缺水阈值线 45 与适宜上限线 80
+  const thr45 = y(45), thr80 = y(80);
+  svg.innerHTML = `
+    <line x1="0" y1="${thr80.toFixed(1)}" x2="${W}" y2="${thr80.toFixed(1)}" stroke="#2c5440" stroke-width="1" stroke-dasharray="4 4"/>
+    <line x1="0" y1="${thr45.toFixed(1)}" x2="${W}" y2="${thr45.toFixed(1)}" stroke="#e5533d" stroke-width="1" stroke-dasharray="4 4" opacity=".6"/>
+    <polyline points="${pts}" fill="none" stroke="#3ecf7a" stroke-width="2.2" stroke-linejoin="round"/>
+    <circle cx="${x(vals.length-1).toFixed(1)}" cy="${y(vals[vals.length-1]).toFixed(1)}" r="3.4" fill="#3ecf7a"/>
+    <text x="6" y="${thr45.toFixed(1)-3}" fill="#e5533d" font-size="8">45 缺水线</text>
+    <text x="6" y="${thr80.toFixed(1)+9}" fill="#9db8a8" font-size="8">80 上限</text>`;
+}
+
+function renderSoil(s) {
+  const soilV = s.soil ? s.soil.value : null;
+  const valveOpen = (s.actuator && s.actuator.drip_valve && s.actuator.drip_valve.state === "open");
+  const st = soilStyle(soilV, valveOpen);
+  $("soilVal").innerHTML = (soilV !== null ? soilV.toFixed(1) : "--") + "<small> %</small>";
+  $("soilStatus").textContent = st.label;
+  $("soilStatus").style.color = st.color;
+  $("gaugeText").textContent = soilV !== null ? Math.round(soilV) : "--";
+  const arc = $("gaugeArc");
+  const pct = soilV !== null ? Math.min(100, Math.max(0, soilV)) : 0;
+  arc.style.strokeDashoffset = String(251.2 * (1 - pct / 100));
+  arc.style.stroke = st.bar;
+  $("soilBar").style.width = pct + "%";
+  $("soilBar").style.background = st.bar;
+  drawSoilSpark(s.soil_history);
+}
+
+// ================= 主快照渲染 =================
 function render(s) {
   // Agent 状态
   const pill = $("agentPill");
@@ -248,44 +507,14 @@ function render(s) {
     ? (s.refresh_mode === "stream" ? "Agent 运行中 · 持续录像" : `Agent 运行中 · ${(s.interval || 0).toFixed(1)}s 刷新`)
     : "Agent 已停止";
   $("steps").textContent = s.steps || 0;
-
-  // 摄像头（以实际帧来源为准：摄像头实拍 / 演示帧降级）
-  const camSrc = (s.detections && s.detections.source) || "demo_frame";
-  $("camPillText").textContent = (camSrc === "usb_cam") ? "USB摄像头" : "演示帧";
   $("modelTag").textContent = (s.detections && s.detections.backend === "ultralytics")
     ? "YOLO 模型" : "模拟检测(降级)";
-  if (s.detections && s.detections.image) {
-    $("camImg").src = s.detections.image;
-    $("camBadge").textContent = (camSrc === "usb_cam") ? "USB摄像头实拍" : "演示帧（摄像头不可用）";
-  }
-  // 检测列表
-  const detList = $("detList");
-  detList.innerHTML = "";
-  const dts = (s.detections && s.detections.detections) || [];
-  dts.forEach(d => {
-    const el = document.createElement("span");
-    el.className = "det " + (d["class"] === "Healthy" ? "healthy" : "disease");
-    el.textContent = `${d["class"]} ${(d.conf * 100).toFixed(0)}%`;
-    detList.appendChild(el);
-  });
-  const sm = (s.detections && s.detections.summary) || {};
-  $("detSummary").textContent = sm.total !== undefined
-    ? `共检出 ${sm.total} 处 · ${sm.diseases && sm.diseases.length ? "病害: " + sm.diseases.join("、") : "无病害"}`
-    : "等待检测…";
 
-  // 土壤湿度
-  const soilV = s.soil ? s.soil.value : null;
-  const valveOpen = (s.actuator && s.actuator.drip_valve && s.actuator.drip_valve.state === "open");
-  const st = soilStyle(soilV, valveOpen);
-  $("soilVal").innerHTML = (soilV !== null ? soilV.toFixed(1) : "--") + "<small> %</small>";
-  $("soilStatus").textContent = st.label;
-  $("soilStatus").style.color = st.color;
-  const arc = $("gaugeArc");
-  const pct = soilV !== null ? Math.min(100, Math.max(0, soilV)) : 0;
-  arc.style.strokeDashoffset = String(251.2 * (1 - pct / 100));
-  arc.style.stroke = st.bar;
-  $("soilBar").style.width = pct + "%";
-  $("soilBar").style.background = st.bar;
+  // 摄像头监控网格
+  renderCams(camsFromSnapshot(s));
+
+  // 土壤湿度监控台
+  renderSoil(s);
 
   // 决策
   const dec = s.decision || {};
@@ -333,7 +562,6 @@ function renderValve(v) {
   $("valveMeta").textContent = open
     ? `流量 ${(v.flow_rate || 0).toFixed(0)} L/h${v.duration_min ? ` · 计划 ${v.duration_min} 分钟` : ""}`
     : "流量 0 L/h · 未运行";
-  // 手柄：开=垂直向下（水流通过），关=斜向上
   $("valveHandle").setAttribute("y2", open ? "30" : "14");
   $("dripPipe").style.opacity = open ? "1" : ".25";
   $("drops").style.opacity = open ? "1" : "0";
@@ -351,28 +579,9 @@ function renderBoom(b) {
   $("boomGroup").classList.toggle("boom-swing", on);
 }
 
-// ---- 持续录像帧：仅刷新画面区与状态条（决策/传感器/执行器保留最近一次完整快照）----
+// ---- 持续录像帧：仅刷新摄像头网格与状态条（决策/传感器/执行器保留最近一次完整快照）----
 function renderFrame(s) {
-  const camSrc = (s.detections && s.detections.source) || "demo_frame";
-  $("camPillText").textContent = (camSrc === "usb_cam") ? "USB摄像头" : "演示帧";
-  $("modelTag").textContent = (s.detections && s.detections.backend === "ultralytics")
-    ? "YOLO 模型" : "模拟检测(降级)";
-  if (s.detections && s.detections.image) {
-    $("camImg").src = s.detections.image;
-    $("camBadge").textContent = (camSrc === "usb_cam") ? "USB摄像头实拍" : "演示帧（摄像头不可用）";
-  }
-  const detList = $("detList");
-  detList.innerHTML = "";
-  ((s.detections && s.detections.detections) || []).forEach(d => {
-    const el = document.createElement("span");
-    el.className = "det " + (d["class"] === "Healthy" ? "healthy" : "disease");
-    el.textContent = `${d["class"]} ${(d.conf * 100).toFixed(0)}%`;
-    detList.appendChild(el);
-  });
-  const sm = (s.detections && s.detections.summary) || {};
-  $("detSummary").textContent = sm.total !== undefined
-    ? `共检出 ${sm.total} 处 · ${sm.diseases && sm.diseases.length ? "病害: " + sm.diseases.join("、") : "无病害"}`
-    : "等待检测…";
+  renderCams(s.cams || []);
   if (s.running !== undefined) {
     const pill = $("agentPill");
     pill.className = "status-pill " + (s.running ? "running" : "stopped");
@@ -383,7 +592,97 @@ function renderFrame(s) {
   if (s.steps !== undefined) $("steps").textContent = s.steps || 0;
 }
 
-// ---- WebSocket 连接 ----
+// ================= 摄像头管理（REST）=================
+async function loadCams() {
+  try {
+    const r = await fetch("/api/cameras", { cache: "no-store" });
+    if (!r.ok) return;
+    const j = await r.json();
+    if (j.ok) renderCams(j.cameras.map(c => ({
+      cam_id: c.id, name: c.name, source: c.source, last_source: c.last_source,
+      available: c.available, ts: "", image: "", detections: [], summary: {},
+    })));
+  } catch (e) { console.warn("loadCams", e); }
+}
+
+async function addCam() {
+  const type = $("newType").value;
+  let raw = $("newSource").value.trim();
+  if (!raw) { alert("请填写摄像头源"); return; }
+  let source = raw;
+  if (type === "usb") source = raw.startsWith("usb:") ? raw : "usb:" + raw;
+  else if (!raw.startsWith(type + "://")) source = type + "://" + raw;
+  const name = $("newName").value.trim();
+  try {
+    const r = await fetch("/api/cameras/add", {
+      method: "POST", cache: "no-store",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ source, name }),
+    });
+    const j = await r.json();
+    if (j.ok) {
+      $("newSource").value = "";
+      $("newName").value = "";
+      await loadCams();
+    } else {
+      alert(j.message || "添加失败");
+    }
+  } catch (e) { alert("添加失败：" + e); }
+}
+
+async function removeCam(camId) {
+  if (!confirm("确认删除该摄像头源？")) return;
+  try {
+    const r = await fetch("/api/cameras/remove", {
+      method: "POST", cache: "no-store",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ cam_id: camId }),
+    });
+    const j = await r.json();
+    if (j.ok) removeCamCard(camId);
+    else alert(j.message || "删除失败");
+  } catch (e) { alert("删除失败：" + e); }
+}
+
+// ================= 摄像头监测预警（每日推送） =================
+function renderAlert(alert) {
+  const card = $("alertCard");
+  if (!alert) {
+    card.style.display = "none";
+    $("alertEmpty").style.display = "block";
+    return;
+  }
+  card.style.display = "block";
+  $("alertEmpty").style.display = "none";
+  const pill = $("alertPill");
+  pill.className = "pill " + (alert.level || "low");
+  pill.textContent = { high: "高 · 紧急处置", medium: "中 · 提前预防", low: "低 · 持续观察" }[alert.level] || alert.level;
+  $("alertTitle").textContent = alert.title || "";
+  $("alertContent").textContent = alert.content || "";
+  $("alertActs").textContent = alert.actions_text || "";
+  $("alertTime").textContent = "推送时间：" + (alert.ts || alert.created_at || "");
+  const img = $("alertImg");
+  if (alert.image_b64) {
+    img.src = "data:image/jpeg;base64," + alert.image_b64;
+    img.style.display = "block";
+  } else {
+    img.style.display = "none";
+  }
+}
+
+async function loadLatestAlert() {
+  try {
+    const r = await fetch("/api/alerts/latest", { cache: "no-store" });
+    if (!r.ok) return;
+    const j = await r.json();
+    if (!j.ok) return;
+    // REST 返回 {kind, data:{...}} 嵌套结构，WS 广播 data 为平铺字段；统一解包
+    const a = j.alert && j.alert.data ? j.alert.data : j.alert;
+    renderAlert(a);
+  } catch (e) { console.warn("loadLatestAlert", e); }
+}
+
+// ================= WebSocket 连接 =================
 let ws = null;
 function connect() {
   const proto = location.protocol === "https:" ? "wss" : "ws";
@@ -394,6 +693,7 @@ function connect() {
       const msg = JSON.parse(e.data);
       if (msg.kind === "state_update") render(msg.data);
       if (msg.kind === "stream_frame") renderFrame(msg.data);
+      if (msg.kind === "alert_push") renderAlert(msg.data);
       if (msg.kind === "agent_error") {
         $("agentPill").className = "status-pill error";
         $("agentPillText").textContent = "Agent 异常";
@@ -408,6 +708,10 @@ function connect() {
   ws.onerror = () => ws.close();
 }
 connect();
+// 初始化摄像头源列表（WS 首帧到达前先展示源信息）
+loadCams();
+// 初始化最近一条摄像头监测预警
+loadLatestAlert();
 // 应用层心跳：浏览器协议层 ping 不一定传给 ASGI，服务端僵尸清理需要可观察消息。
 setInterval(() => {
   if (ws && ws.readyState === WebSocket.OPEN) {

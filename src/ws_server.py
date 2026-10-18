@@ -24,7 +24,9 @@ import time
 from pathlib import Path
 
 from . import db
+from .agent.daily_alert import DailyAlertScheduler
 from .agent.runner import runner
+from .vision.capture import camera_manager
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 WEB_INDEX = BASE_DIR / "web" / "index.html"
@@ -45,6 +47,7 @@ class TeaAgentASGI:
         self.loop: asyncio.AbstractEventLoop | None = None
         self._reaper_task: asyncio.Task | None = None
         self._runner_subscribed = False
+        self.alert_scheduler = DailyAlertScheduler(runner.garden_key)
 
     # ---------- ASGI 入口 ----------
     async def __call__(self, scope, receive, send):
@@ -60,9 +63,17 @@ class TeaAgentASGI:
             msg = await receive()
             if msg["type"] == "lifespan.startup":
                 self.loop = asyncio.get_running_loop()
+                # 确保扩展表（camera_alert_log 等）存在：8510 独立运行时也要建表
+                try:
+                    db.init_db_ext()
+                except Exception:  # noqa: BLE001 - 数据库不可用时降级，后续写库也会降级
+                    pass
                 if not self._runner_subscribed:
                     runner.subscribe(self._broadcast)
                     self._runner_subscribed = True
+                # 每日摄像头监测预警调度器：到点生成一次并广播 kind=alert_push
+                self.alert_scheduler.subscribe(self._broadcast)
+                self.alert_scheduler.start()
                 # 僵尸连接清理任务：无心跳超过 60 秒的 WS 客户端直接踢出，
                 # 防止主站页面反复刷新/会话残留导致 clients 无限累积、广播变慢。
                 # 必须保存任务引用，否则会被事件循环垃圾回收导致清理永不运行
@@ -71,6 +82,7 @@ class TeaAgentASGI:
             elif msg["type"] == "lifespan.shutdown":
                 if self._reaper_task is not None:
                     self._reaper_task.cancel()
+                self.alert_scheduler.stop()
                 runner.stop()
                 await send({"type": "lifespan.shutdown.complete"})
                 return
@@ -99,9 +111,10 @@ class TeaAgentASGI:
         payload = json.dumps(event, ensure_ascii=False, default=str)
 
         async def _send_all():
-            for ws in list(self.clients):
+            # 并发发送：每个客户端独立限时，慢/死连接只拖累自己，
+            # 不阻塞其他客户端的消息投递（旧的串行方案会被慢客户端拖住整批广播）。
+            async def _one(ws):
                 try:
-                    # 限时发送：慢/死连接不阻塞事件循环（取消后该连接视为失效移除）
                     await asyncio.wait_for(
                         ws["send"]({"type": "websocket.send", "text": payload}), timeout=0.5)
                     ws["last_seen"] = time.monotonic()
@@ -110,6 +123,10 @@ class TeaAgentASGI:
                         self.clients.remove(ws)
                     except ValueError:
                         pass
+
+            if self.clients:
+                await asyncio.gather(*[_one(ws) for ws in list(self.clients)],
+                                     return_exceptions=True)
 
         try:
             asyncio.run_coroutine_threadsafe(_send_all(), self.loop)
@@ -161,6 +178,15 @@ class TeaAgentASGI:
                 body = _json_body(runner.latest_frame)
             elif method == "GET" and path == "/api/history":
                 body = _json_body({"items": db.agent_decision_history(runner.garden_key, limit=20)})
+            elif method == "GET" and path == "/api/alerts/latest":
+                # 最近一条摄像头监测预警（内存优先，服务重启后回退查库）
+                latest = self.alert_scheduler.latest()
+                if latest is None:
+                    latest = db.latest_camera_alert(runner.garden_key)
+                body = _json_body({"ok": True, "alert": latest})
+            elif method == "GET" and path == "/api/alerts/history":
+                body = _json_body({"ok": True,
+                                   "items": db.camera_alert_history(runner.garden_key, limit=30)})
             elif method == "POST" and path == "/api/agent/start":
                 # 支持可选 body: {"refresh_mode": "stream"|"interval", "interval": 秒}
                 runner.configure(refresh_mode=payload.get("refresh_mode"),
@@ -180,6 +206,24 @@ class TeaAgentASGI:
                 # 否则会阻塞 uvicorn 事件循环，导致网页/WS/其他接口全部卡住
                 snapshot = await asyncio.to_thread(runner.step)
                 body = _json_body({"ok": True, "snapshot": snapshot})
+            elif method == "GET" and path == "/api/cameras":
+                # 摄像头源列表（监控台管理）
+                body = _json_body({"ok": True, "cameras": camera_manager.list()})
+            elif method == "POST" and path == "/api/cameras/add":
+                # 添加摄像头源：{"source": "usb:1" / "rtsp://…" / "http://…", "name": "可选"}
+                cam = await asyncio.to_thread(camera_manager.add,
+                                              payload.get("source", ""), payload.get("name", ""))
+                if cam is None:
+                    body = _json_body({"ok": False, "message": "无效的摄像头源，支持 usb:N / rtsp:// / http(s)://"}, 400)
+                else:
+                    body = _json_body({"ok": True, "camera": cam})
+            elif method == "POST" and path == "/api/cameras/remove":
+                # 删除摄像头源：{"cam_id": "cam2"}
+                removed = await asyncio.to_thread(camera_manager.remove, payload.get("cam_id", ""))
+                if not removed:
+                    body = _json_body({"ok": False, "message": "摄像头不存在"}, 404)
+                else:
+                    body = _json_body({"ok": True})
             else:
                 status = 404
                 body = _json_body({"ok": False, "message": "not found"}, 404)

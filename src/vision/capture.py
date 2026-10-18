@@ -1,8 +1,15 @@
 """摄像头采集与演示帧生成。
 
 CameraCapture：
-  - 优先尝试 OpenCV(cv2) 打开 USB 摄像头（index 可配置）
-  - cv2 未安装或摄像头不可用时，自动降级返回 make_demo_frame() 合成帧
+  - 支持多类画面源（source）：
+      usb:N        USB 摄像头（index 可配置，默认后端 MSMF→DSHOW→ANY 探测）
+      rtsp://...   网络摄像头 RTSP 流（海康/大华/小米等，需 FFMPEG 后端）
+      http(s)://... MJPEG 流 / 快照（手机 IP Webcam 等）
+  - 任何源不可用/读到黑帧时，自动降级返回 make_demo_frame() 合成帧
+
+CameraManager：
+  多摄像头源管理器（监控台）：默认注册一个 usb:0 主源，
+  支持运行时 add / remove / list，每个源独立采集与检测。
 
 make_demo_frame：
   用纯 numpy 绘制「茶园叶片」演示帧（若干叶片 + 病斑），
@@ -10,6 +17,7 @@ make_demo_frame：
 """
 from __future__ import annotations
 
+import os
 import threading
 import time
 
@@ -155,26 +163,131 @@ def _run_with_timeout(fn, timeout: float, default):
 
 
 class CameraCapture:
-    """USB 摄像头采集（带自动降级）。
+    """摄像头采集（支持 USB / RTSP / HTTP 多类源，带自动降级）。
 
-    帧来源标记：
-      - last_source == "usb_cam"    ：本轮画面来自摄像头实拍
-      - last_source == "demo_frame" ：摄像头不可用/读到无效（黑）帧，降级为演示合成帧
+    帧来源标记（last_source）：
+      - "usb_cam"    ：画面来自 USB 摄像头实拍
+      - "net_cam"    ：画面来自网络视频流（RTSP / HTTP）
+      - "demo_frame" ：源不可用/读到无效（黑）帧，降级为演示合成帧
     """
 
     _BLACK_FRAME_MEAN = 8.0  # 平均亮度低于该值视为无效（黑）帧
 
-    def __init__(self, index: int = 0, fallback: bool = True):
+    def __init__(self, index: int = 0, fallback: bool = True, source: str | None = None,
+                 name: str | None = None):
+        # source: None / "usb:N" → USB 摄像头；"rtsp://…"/"http(s)://…" → 网络视频流
+        src = (source or os.getenv("CAMERA_SOURCE", "") or "").strip()
+        if not src or src.lower().startswith("usb:"):
+            src = f"usb:{index}"
+        self.source = src
+        self.is_network = src.lower().startswith(("rtsp://", "http://", "https://"))
         self.index = index
         self.fallback = fallback
+        self.name = name or (self.source if self.is_network else f"USB 摄像头 #{index}")
         self._cap = None
         self._lock = threading.Lock()
+        # 实例级摄像头 IO 锁：同源任意时刻只允许一个原生调用（构造/试读/read/release）执行。
+        # 拿锁方式为非阻塞 acquire(timeout)：若上一个调用仍卡在原生层（MSMF 坏句柄），
+        # 本轮立即放弃而非排队等待 —— 这从根本上杜绝并发构造/释放导致的
+        # Windows access violation 崩溃，也绝不出现锁等待死锁；
+        # 卡住的调用结束后锁自动释放，采集自动恢复（期间该源降级为演示帧，系统保持流畅）。
+        self._io_lock = threading.Lock()
         self.last_source = "demo_frame"
         # 快速降级：确认所有后端都打不开摄像头后，一段时间内不再反复重建句柄
         #（cv2.VideoCapture 在无设备/占用时可能阻塞数秒，反复重试会把 Agent 每轮都拖慢）
         self._fail_fast_until = 0.0
         # 惰性打开：初始化时不抢占摄像头（8510 服务导入、Agent 未启动时摄像头保持空闲），
-        # 首次 read_frame() 才尝试打开，避免服务启动就占用摄像头
+        # 由后台采集线程首次循环时才尝试打开
+        # ---- 后台采集线程（每源一个，主线程永不阻塞在摄像头 IO 上）----
+        self._frame_lock = threading.Lock()
+        self._latest_frame: np.ndarray | None = None
+        self._bg_stop = threading.Event()
+        self._bg_thread: threading.Thread | None = None
+        self._read_busy = False   # 上次限时 read 超时后标记：不重复创建超时线程
+        # 不在此处启动后台线程：模块级单例（camera / camera_manager）导入时
+        # 若立即启动会抢摄像头/起线程（pytest 导入即并发构造导致原生崩溃）。
+        # 由 read_frame() 首次调用时惰性启动（_ensure_bg）。
+
+    def _start_bg(self) -> None:
+        """启动本源的常驻后台采集线程（daemon）：持续刷新最新帧缓存。
+
+        主线程（Agent 主循环/推流/REST）只读缓存，摄像头任何 IO 卡顿都只影响
+        后台线程自身，绝不拖累 Agent —— 这是根治「摄像头假成功/句柄漂移导致
+        越跑越卡、Agent 启动不了/停不掉」的关键。
+        """
+        if self._bg_thread is not None and self._bg_thread.is_alive():
+            return
+        self._bg_stop.clear()
+        self._bg_thread = threading.Thread(target=self._bg_loop, daemon=True,
+                                           name=f"cam-bg-{self.index}-{self.source[:24]}")
+        self._bg_thread.start()
+
+    def _bg_loop(self) -> None:
+        """后台采集循环：打开→读→缓存最新有效帧；失败走快速降级休眠。
+
+        任何异常都不抛出（daemon 线程异常即退出）；摄像头恢复由降级窗口
+        到期后的重试自动接回。窗口内主线程读旧缓存或演示帧，系统始终流畅。
+        """
+        while not self._bg_stop.is_set():
+            try:
+                self._ensure_open()
+                if time.monotonic() < self._fail_fast_until:
+                    # 已确认不可用：窗口内不重试（窗口长短按源类型：网络 10s / USB 60s）
+                    self._bg_stop.wait(2.0)
+                    continue
+                frame = self._read_valid_frame()
+                if frame is not None:
+                    with self._frame_lock:
+                        self._latest_frame = frame
+                        self.last_source = self._src_tag()
+                    self._bg_stop.wait(0.05)   # 正常：贴近摄像头帧率循环
+                    continue
+                # 黑帧/读取失败 → 重建句柄再试一次（占用恢复、驱动瞬态）。
+                # 注意：不能调 self.release()（它会 join 当前线程自己造成自杀退出），
+                # 只内联摘除并释放句柄，再打开新句柄，全程串行。
+                with self._lock:
+                    cap = self._cap
+                    self._cap = None
+                    self._read_busy = False  # 新句柄即将建立：允许重新创建限时读线程
+                self._release_cap(cap)
+                self._open()
+                frame = self._read_valid_frame()
+                if frame is not None:
+                    with self._frame_lock:
+                        self._latest_frame = frame
+                        self.last_source = self._src_tag()
+                    continue
+                # 打开成功但持续读不到有效帧（句柄异常但 isOpened=True），
+                # 或打开失败 → 快速降级窗口，避免高频重试堆积 IO/线程
+                self._fail_fast_until = time.monotonic() + (10.0 if self.is_network else 120.0)
+                self._bg_stop.wait(2.0)
+            except Exception:  # noqa: BLE001 - 单轮失败不退出循环，降级窗口后重试
+                self._bg_stop.wait(2.0)
+
+    @property
+    def kind(self) -> str:
+        """源类型：usb / rtsp / http。"""
+        if self.is_network:
+            return "rtsp" if self.source.lower().startswith("rtsp") else "http"
+        return "usb"
+
+    # 进程级互斥说明见 _io_lock（实例级非阻塞锁，注释在 __init__）。
+    def _read_with_lock(self, cap) -> np.ndarray | None:
+        """持锁读一帧有效画面；拿不到锁（上一调用仍卡住）立即返回 None。"""
+        if not self._io_lock.acquire(timeout=1.0):
+            return None
+        try:
+            ok, frame = cap.read()
+            if ok and frame is not None and frame.size > 0 and float(frame.mean()) >= self._BLACK_FRAME_MEAN:
+                return frame
+            return None
+        except Exception:  # noqa: BLE001
+            return None
+        finally:
+            try:
+                self._io_lock.release()
+            except Exception:  # noqa: BLE001
+                pass
 
     def _try_open_backend(self, backend, holder: dict | None = None) -> object | None:
         """尝试用指定后端打开并验证能读到一帧有效画面；返回可用句柄或 None。
@@ -182,39 +295,113 @@ class CameraCapture:
         仅构造成功不算数——MSMF 在设备被占用时 isOpened()=True 但 read() 无限阻塞，
         必须在限时线程内完成「构造→试读→非黑」验证，坏后端直接弃用换下一个。
         holder 用于在超时后让调用方拿到尚未返回的句柄并主动释放。
+        整个操作持 _io_lock：同一源同时最多一个原生调用，杜绝并发构造/释放崩溃；
+        持锁期间失败路径内联释放句柄（避免可重入锁死锁）。
         """
         import cv2
-        cap = None
-        try:
-            cap = cv2.VideoCapture(self.index, backend)
-        except Exception:  # noqa: BLE001
-            try:
-                cap = cv2.VideoCapture(self.index)
-            except Exception:  # noqa: BLE001
-                return None
-        if holder is not None:
-            holder["cap"] = cap
-        if cap is None or not cap.isOpened():
-            self._release_cap(cap)
+        if not self._io_lock.acquire(timeout=1.0):
             return None
-        # 试读验证：读不到有效帧（黑帧/阻塞）的后端立即弃用并释放
         try:
-            ok, frame = cap.read()
-            if ok and frame is not None and frame.size > 0 and float(frame.mean()) >= self._BLACK_FRAME_MEAN:
-                return cap
-        except Exception:  # noqa: BLE001
-            pass
-        self._release_cap(cap)
-        return None
+            cap = None
+            try:
+                cap = cv2.VideoCapture(self.index, backend)
+            except Exception:  # noqa: BLE001
+                try:
+                    cap = cv2.VideoCapture(self.index)
+                except Exception:  # noqa: BLE001
+                    return None
+            if holder is not None:
+                holder["cap"] = cap
+            if cap is None or not cap.isOpened():
+                try:
+                    if cap is not None:
+                        cap.release()
+                except Exception:  # noqa: BLE001
+                    pass
+                return None
+            # 试读验证：读不到有效帧（黑帧/阻塞）的后端立即弃用并释放
+            try:
+                ok, frame = cap.read()
+                if ok and frame is not None and frame.size > 0 and float(frame.mean()) >= self._BLACK_FRAME_MEAN:
+                    return cap
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                cap.release()
+            except Exception:  # noqa: BLE001
+                pass
+            return None
+        finally:
+            try:
+                self._io_lock.release()
+            except Exception:  # noqa: BLE001
+                pass
 
-    @staticmethod
-    def _release_cap(cap) -> None:
-        """限时释放句柄，避免坏驱动在 release() 中再次阻塞调用线程。"""
+    def _release_cap(self, cap) -> None:
+        """限时释放句柄（持 _io_lock），避免坏驱动在 release() 中再次阻塞调用线程。"""
         if cap is None:
             return
-        _run_with_timeout(lambda: cap.release(), 1.0, None)
+
+        def _do():
+            if not self._io_lock.acquire(timeout=1.0):
+                return
+            try:
+                cap.release()
+            except Exception:  # noqa: BLE001
+                pass
+            finally:
+                try:
+                    self._io_lock.release()
+                except Exception:  # noqa: BLE001
+                    pass
+
+        _run_with_timeout(_do, 1.0, None)
 
     def _open(self) -> None:
+        """按源类型打开摄像头：USB 走后端探测，网络流走 FFMPEG。"""
+        if self.is_network:
+            self._open_network()
+        else:
+            self._open_usb()
+
+    def _open_network(self) -> None:
+        """打开 RTSP / HTTP 网络视频流（FFMPEG 后端，限时 5 秒 + 试读验证）。
+
+        RTSP/HTTP 源在不可达时构造可能长时间阻塞，必须限时；
+        断线后由 read_frame() 走 10 秒快速重连窗口自动恢复。
+        """
+        import cv2
+        holder: dict = {}
+
+        def _do():
+            if not self._io_lock.acquire(timeout=1.0):
+                return None
+            try:
+                cap = cv2.VideoCapture(self.source, cv2.CAP_FFMPEG)
+                holder["cap"] = cap
+                return cap
+            finally:
+                try:
+                    self._io_lock.release()
+                except Exception:  # noqa: BLE001
+                    pass
+
+        cap = _run_with_timeout(_do, 5.0, None)
+        if cap is None or not cap.isOpened():
+            self._release_cap(holder.get("cap"))
+            self._fail_fast_until = time.monotonic() + 10.0
+            return
+        # 试读验证：本地局域网读帧是毫秒级，读不到有效帧即弃用（限时线程 + 实例锁）
+        frame = _run_with_timeout(lambda: self._read_with_lock(cap), 1.5, None)
+        if frame is not None:
+            self._cap = cap
+            self._read_busy = False  # 新句柄：允许重新创建限时读线程
+            self._fail_fast_until = 0.0
+            return
+        self._release_cap(cap)
+        self._fail_fast_until = time.monotonic() + 10.0
+
+    def _open_usb(self) -> None:
         """按「原生后端优先」顺序打开摄像头：MSMF(Windows) → DSHOW → 默认。
 
         所有后端共享 4 秒总预算，每个后端在限时线程内完成「构造→试读验证」
@@ -224,7 +411,10 @@ class CameraCapture:
         try:
             import cv2
             backends = []
-            for name in ("CAP_MSMF", "CAP_DSHOW"):
+            # DSHOW 优先：DirectShow 在摄像头占用/无设备时构造失败快速返回、
+            # 无 MSMF 的异步 OnReadSample 回调（反复构造/试读在坏环境下会触发
+            # OpenCV 原生 heap corruption 崩溃）。MSMF 仅作兜底。
+            for name in ("CAP_DSHOW", "CAP_MSMF"):
                 if hasattr(cv2, name):
                     backends.append(getattr(cv2, name))
             backends.append(cv2.CAP_ANY)
@@ -241,6 +431,7 @@ class CameraCapture:
                 )
                 if cap is not None:
                     self._cap = cap
+                    self._read_busy = False  # 新句柄：允许重新创建限时读线程
                     self._fail_fast_until = 0.0
                     return
                 # 超时后工作线程可能仍卡在 read()，主动释放它创建的句柄。
@@ -258,76 +449,65 @@ class CameraCapture:
 
     @property
     def available(self) -> bool:
-        return self._cap is not None
+        with self._frame_lock:
+            return self._latest_frame is not None
 
     def _read_valid_frame(self) -> np.ndarray | None:
         """尝试从当前摄像头句柄读一帧有效（非黑）画面。
 
         cap.read() 在句柄失效时（Windows MSMF 常见：grab 失败/设备被占用）
         可能无限阻塞且不抛异常，因此放入子线程并设 1.5 秒超时；
-        超时判定句柄失效，由调用方走重建/快速降级，避免 Agent 主循环被拖死。
+        超时判定句柄失效，由后台线程走重建/快速降级，避免 Agent 主循环被拖死。
+
+        超时后置 _read_busy=True：被释放的坏句柄上残留的阻塞 read 线程
+        不再被新调用叠加（同源同一时刻最多一个残留线程），直到重建成功新句柄。
         """
-        if self._cap is None:
+        if self._cap is None or self._read_busy:
             return None
         cap = self._cap
         holder: dict = {}
 
         def _do_read():
-            try:
-                ok, frame = cap.read()
-                holder["res"] = (ok, frame)
-            except Exception as e:  # noqa: BLE001
-                holder["err"] = str(e)
+            holder["frame"] = self._read_with_lock(cap)  # 持实例锁读帧；拿不到锁返回 None
 
         t = threading.Thread(target=_do_read, daemon=True)
         t.start()
         t.join(timeout=1.5)
         if t.is_alive():
             # 不能把仍在阻塞的句柄留给下一轮继续 read()：先摘除并异步释放，
-            # 后续由 read_frame() 重新打开摄像头。
+            # 后续由后台线程重新打开摄像头；同时标记忙碌，不重复创建超时线程。
+            # （卡住的 read 线程持锁期间，本源的后续原生调用会自动跳过 → 仅该源降级）
+            self._read_busy = True
             self._cap = None
             self._release_cap(cap)
             return None  # read 阻塞超时 → 上层重建句柄或快速降级
-        if "err" in holder:
-            return None
-        ok, frame = holder.get("res", (False, None))
-        if (ok and frame is not None and frame.size > 0
-                and float(frame.mean()) >= self._BLACK_FRAME_MEAN):
-            return frame
-        return None
+        self._read_busy = False
+        return holder.get("frame")
+
+    def _src_tag(self) -> str:
+        """当前源的实拍标记：usb_cam / net_cam。"""
+        return "net_cam" if self.is_network else "usb_cam"
+
+    def _ensure_bg(self) -> None:
+        """确保本源的常驻后台采集线程已启动（未启动或已退出则启动）。"""
+        if self._bg_thread is not None and self._bg_thread.is_alive():
+            return
+        self._start_bg()
 
     def read_frame(self) -> np.ndarray | None:
-        """读取一帧 BGR 图像。
+        """读取最近一帧 BGR 图像（主线程：只读缓存，毫秒级返回，永不阻塞）。
 
-        惰性打开：首次调用才尝试初始化摄像头。
-        摄像头不可用，或读到无效（纯黑）帧时：
-          1) 快速降级窗口内不重试，直接返回演示合成帧（避免无设备时每轮阻塞数秒）
-          2) 窗口外（或句柄曾打开成功）先重新打开摄像头再试一次
-        帧来源记录在 last_source：usb_cam / demo_frame。
+        画面由后台采集线程持续刷新：摄像头可用时返回实拍帧；
+        不可用/尚无帧时返回演示合成帧（fallback=True）或 None。
+        任何摄像头 IO 卡顿只发生在后台线程，不影响 Agent 主循环与推流。
         """
-        with self._lock:
-            self._ensure_open()
-            if time.monotonic() < self._fail_fast_until:
-                # 已确认摄像头不可用：不重试，直接降级演示帧
-                if self.fallback:
-                    self.last_source = "demo_frame"
-                    return make_demo_frame()
-                self.last_source = "none"
-                return None
-            frame = self._read_valid_frame()
+        self._ensure_bg()  # 惰性启动后台采集（构造不启动，首次读取时启动）
+        with self._frame_lock:
+            frame = self._latest_frame
             if frame is not None:
-                self.last_source = "usb_cam"
+                self.last_source = self._src_tag()
                 return frame
-            # 黑帧/读取失败 → 重建句柄再试一次（可解决占用恢复、驱动瞬态问题）
-            self.release()
-            self._open()
-            frame = self._read_valid_frame()
-            if frame is not None:
-                self.last_source = "usb_cam"
-                return frame
-            # 打开成功但持续读不到有效帧（MSMF 常见：句柄异常但 isOpened=True）
-            # 或打开失败 → 进入快速降级窗口，避免每轮都浪费数秒重试
-            self._fail_fast_until = time.monotonic() + 60.0
+        # 后台线程还在初始化（或摄像头不可用）：降级演示帧
         if self.fallback:
             self.last_source = "demo_frame"
             return make_demo_frame()
@@ -335,11 +515,24 @@ class CameraCapture:
         return None
 
     def release(self) -> None:
+        """停止后台采集线程并释放摄像头句柄。
+
+        先停线程再释放句柄：避免后台采集线程与释放动作并发触碰同一设备
+        （并发构造/释放是 MSMF access violation 崩溃的根因）。
+        """
+        self._bg_stop.set()
+        # 等待后台线程退出（正常 2s 内；卡在原生调用时最多等 5s，
+        # join 超时也不强杀——卡住的线程由实例锁隔离，只会让该源降级）
+        if self._bg_thread is not None and self._bg_thread.is_alive():
+            self._bg_thread.join(timeout=5)
         with self._lock:
             if self._cap is not None:
                 cap = self._cap
                 self._cap = None  # 先解除引用，避免阻塞期间其他逻辑复用坏句柄
                 self._release_cap(cap)
+        with self._frame_lock:
+            self._latest_frame = None
+        self._bg_stop.clear()  # 允许下次 _start_bg() 重启采集
 
 
 # 模块级单例（惰性创建，避免无摄像头环境启动报错）
@@ -351,8 +544,120 @@ def _get_camera() -> CameraCapture:
     global _camera_instance
     with _camera_lock:
         if _camera_instance is None:
-            _camera_instance = CameraCapture(index=0)
+            _camera_instance = CameraCapture(index=0, source=os.getenv("CAMERA_SOURCE"))
         return _camera_instance
 
 
 camera = _get_camera()
+
+
+class CameraManager:
+    """多摄像头源管理器（监控台）：默认注册 usb:0 主源，支持运行时增删。
+
+    每个源是一个独立的 CameraCapture 实例，互不干扰；
+    删除源会释放其摄像头句柄，不影响其他源。
+    """
+
+    def __init__(self):
+        self._cams: dict[str, CameraCapture] = {}
+        self._meta: dict[str, dict] = {}
+        self._lock = threading.Lock()
+        self._seq = 0
+        self._add_default()
+
+    # ---------- 内部 ----------
+    def _next_id(self) -> str:
+        self._seq += 1
+        return f"cam{self._seq}"
+
+    def _add_default(self) -> None:
+        """默认主源：usb:0（可用 CAMERA_SOURCE 环境变量覆盖为网络源）。"""
+        with self._lock:
+            src = (os.getenv("CAMERA_SOURCE", "") or "").strip() or "usb:0"
+            cam_id = self._next_id()
+            inst = CameraCapture(source=src)
+            self._cams[cam_id] = inst
+            self._meta[cam_id] = {
+                "id": cam_id, "name": inst.name, "source": src,
+                "kind": inst.kind, "enabled": True, "added_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            }
+
+    # ---------- 查询 ----------
+    def list(self) -> list[dict]:
+        """返回所有源的元信息 + 实时可用状态（不含画面帧，供 REST/页面列表）。"""
+        with self._lock:
+            out = []
+            for cam_id, inst in self._cams.items():
+                meta = dict(self._meta[cam_id])
+                meta.update({
+                    "available": inst.available,
+                    "last_source": inst.last_source,
+                })
+                out.append(meta)
+            return out
+
+    def get(self, cam_id: str) -> CameraCapture | None:
+        with self._lock:
+            return self._cams.get(cam_id)
+
+    def ids(self) -> list[str]:
+        with self._lock:
+            return list(self._cams.keys())
+
+    # ---------- 增删 ----------
+    def add(self, source: str, name: str = "") -> dict | None:
+        """添加一个摄像头源（usb:N / rtsp://… / http(s)://…）。校验通过返回元信息。"""
+        src = (source or "").strip()
+        if not src:
+            return None
+        if not src.lower().startswith(("usb:", "rtsp://", "http://", "https://")):
+            return None
+        with self._lock:
+            cam_id = self._next_id()
+            inst = CameraCapture(source=src, name=name.strip() or None)
+            self._cams[cam_id] = inst
+            self._meta[cam_id] = {
+                "id": cam_id, "name": inst.name, "source": src,
+                "kind": inst.kind, "enabled": True, "added_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            }
+            return dict(self._meta[cam_id])
+
+    def remove(self, cam_id: str) -> bool:
+        """删除一个源并释放其摄像头句柄。默认主源也允许删除（演示将无实拍）。"""
+        with self._lock:
+            inst = self._cams.pop(cam_id, None)
+            self._meta.pop(cam_id, None)
+        if inst is not None:
+            inst.release()
+            return True
+        return False
+
+    # ---------- 采集 ----------
+    def read_all(self) -> list[dict]:
+        """依次读取所有启用源的一帧（由 runner 调用，返回帧 + 来源标记）。"""
+        out = []
+        for cam_id, inst in list(self._cams.items()):
+            meta = self._meta.get(cam_id, {})
+            try:
+                frame = inst.read_frame()
+                out.append({
+                    "cam_id": cam_id,
+                    "name": meta.get("name", cam_id),
+                    "source": meta.get("source", inst.source),
+                    "kind": inst.kind,
+                    "last_source": inst.last_source,
+                    "frame": frame,
+                })
+            except Exception:  # noqa: BLE001 - 单路失败不影响其他路
+                out.append({
+                    "cam_id": cam_id,
+                    "name": meta.get("name", cam_id),
+                    "source": meta.get("source", inst.source),
+                    "kind": inst.kind,
+                    "last_source": "demo_frame",
+                    "frame": None,
+                })
+        return out
+
+
+camera_manager = CameraManager()

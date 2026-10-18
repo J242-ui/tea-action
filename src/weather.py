@@ -2,8 +2,14 @@
 
 提供实时天气、7 天预报、空气质量、生活指数的获取。
 未配置 API Key 或开启演示模式时，返回内置演示数据以便体验界面。
+
+性能：真实 Key 模式带 10 分钟 TTL 缓存（进程内）——Agent 每 5s 一轮决策
+不会每轮都打两次网络请求，避免慢网络把决策循环拖住；缓存过期后自动刷新。
 """
 from __future__ import annotations
+
+import threading
+import time
 
 import requests
 
@@ -11,6 +17,11 @@ from . import config
 
 BASE_URL = "https://devapi.qweather.com"
 GEO_URL = "https://geoapi.qweather.com"
+
+# 真实请求超时（秒）：网络慢时快速失败，不拖住 Agent 决策线程
+REQUEST_TIMEOUT = 5
+# 天气数据缓存时长（秒）：实时数据 10 分钟内变化极小，足够支撑高频决策
+CACHE_TTL = 600
 
 
 class WeatherError(RuntimeError):
@@ -21,15 +32,29 @@ class WeatherClient:
     def __init__(self, api_key: str | None = None, demo: bool | None = None):
         self.api_key = api_key if api_key is not None else config.get_weather_api_key()
         self.demo = demo if demo is not None else (not self.api_key or config.is_demo_mode())
+        # 进程内 TTL 缓存：{"key": (expire_ts, data)}，跨实例共享（Agent 每轮 new 客户端）
+        self._cache: dict = {}
+        self._cache_lock = threading.Lock()
 
     # ---------- 基础请求 ----------
     def _get(self, base: str, path: str, params: dict) -> dict:
         params = {**params, "key": self.api_key}
-        resp = requests.get(f"{base}{path}", params=params, timeout=10)
+        resp = requests.get(f"{base}{path}", params=params, timeout=REQUEST_TIMEOUT)
         resp.raise_for_status()
         data = resp.json()
         if data.get("code") != "200":
             raise WeatherError(f"和风天气接口返回异常: code={data.get('code')}")
+        return data
+
+    def _cached(self, key: str, fn) -> dict:
+        """读缓存；未命中/过期时调用 fn 并写缓存。缓存写失败/读取异常一律放行。"""
+        with self._cache_lock:
+            hit = self._cache.get(key)
+            if hit is not None and hit[0] > time.monotonic():
+                return hit[1]
+        data = fn()
+        with self._cache_lock:
+            self._cache[key] = (time.monotonic() + CACHE_TTL, data)
         return data
 
     # ---------- 数据接口 ----------
@@ -37,13 +62,15 @@ class WeatherClient:
         """实时天气。location 可为 LocationID 或 经度,纬度。"""
         if self.demo:
             return self._demo_now()
-        return self._get(BASE_URL, "/v7/weather/now", {"location": location})
+        return self._cached(f"now:{location}",
+                            lambda: self._get(BASE_URL, "/v7/weather/now", {"location": location}))
 
     def get_forecast(self, location: str, days: int = 7) -> dict:
         """未来 days 天预报（和风天气支持 3/7/10/15 天）。"""
         if self.demo:
             return self._demo_forecast(days)
-        return self._get(BASE_URL, f"/v7/weather/{days}d", {"location": location})
+        return self._cached(f"forecast:{location}:{days}",
+                            lambda: self._get(BASE_URL, f"/v7/weather/{days}d", {"location": location}))
 
     def get_air(self, location: str) -> dict:
         """实时空气质量。"""

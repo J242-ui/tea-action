@@ -151,6 +151,52 @@ def main() -> None:
     status = _api("/api/status")
     snap = status.get("latest") or {}
 
+    # ---------- 摄像头源管理（监控台） ----------
+    st.divider()
+    st.markdown("### 📹 摄像头源管理")
+    st.caption("默认已注册 USB 摄像头 (usb:0)。可添加网络摄像头（RTSP/HTTP），多路画面在动态监控台网页实时显示。")
+    cams = _api("/api/cameras").get("cameras", [])
+    if cams:
+        rows = [{
+            "ID": c.get("id"),
+            "名称": c.get("name", ""),
+            "来源": c.get("source", ""),
+            "类型": {"usb": "USB", "rtsp": "RTSP", "http": "HTTP"}.get(c.get("kind"), c.get("kind", "")),
+            "状态": "🟢 可用" if c.get("available") else "⚪ 待用",
+            "最近帧": {"usb_cam": "USB实拍", "net_cam": "网络实拍",
+                       "demo_frame": "演示帧"}.get(c.get("last_source"), "-"),
+        } for c in cams]
+        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+    else:
+        st.info("暂无摄像头源")
+    a1, a2 = st.columns([2, 1])
+    with a1:
+        src_input = st.text_input("摄像头源", placeholder="usb:1 / rtsp://user:pwd@ip:554/... / http://ip:8080/video",
+                                  key="cam_src")
+    with a2:
+        st.markdown("")
+        st.markdown("")
+        if st.button("➕ 添加摄像头源", type="primary"):
+            if src_input.strip():
+                r = _api("/api/cameras/add", "POST", timeout=10, data={"source": src_input.strip()})
+                st.toast("已添加" if r.get("ok") else f"添加失败：{r.get('message')}")
+                if r.get("ok"):
+                    st.rerun()
+            else:
+                st.toast("请填写摄像头源")
+    if cams:
+        b1, b2 = st.columns([2, 1])
+        with b1:
+            del_id = st.selectbox("选择要删除的摄像头", [c.get("id") for c in cams], key="cam_del")
+        with b2:
+            st.markdown("")
+            st.markdown("")
+            if st.button("🗑 删除摄像头源"):
+                r = _api("/api/cameras/remove", "POST", timeout=10, data={"cam_id": del_id})
+                st.toast("已删除" if r.get("ok") else f"删除失败：{r.get('message')}")
+                if r.get("ok"):
+                    st.rerun()
+
     # ---------- 刷新设置区 ----------
     cur_mode = status.get("refresh_mode", "interval")
     cur_interval = float(status.get("interval", 5.0) or 5.0)
@@ -205,7 +251,8 @@ def main() -> None:
             if img:
                 src = (snap.get("detections") or {}).get("source", "demo_frame")
                 backend = (snap.get("detections") or {}).get("backend", "?")
-                src_cn = "USB 摄像头实拍" if src == "usb_cam" else "演示帧（摄像头不可用）"
+                src_cn = {"usb_cam": "USB 摄像头实拍", "net_cam": "网络摄像头实拍"}.get(
+                    src, "演示帧（摄像头不可用）")
                 st.image(img, caption=f"检测帧（{backend} · 来源：{src_cn}）", width="stretch")
             else:
                 st.info("暂无画面：请点击「立即执行一步」生成检测帧。")

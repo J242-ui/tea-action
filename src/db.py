@@ -503,6 +503,19 @@ CREATE TABLE IF NOT EXISTS agent_decision_log (
     created_at    DATETIME     DEFAULT CURRENT_TIMESTAMP,
     KEY idx_decision (garden_key, created_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS camera_alert_log (
+    id           BIGINT AUTO_INCREMENT PRIMARY KEY,
+    garden_key   VARCHAR(64)  NOT NULL,
+    alert_date   VARCHAR(16)  NOT NULL,
+    title        VARCHAR(255) DEFAULT NULL,
+    content      TEXT,
+    level        VARCHAR(16)  DEFAULT 'low',
+    actions_text TEXT,
+    image_base64 MEDIUMTEXT,
+    created_at   DATETIME     DEFAULT CURRENT_TIMESTAMP,
+    KEY idx_alert (garden_key, alert_date)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 """
     conn = connect()
     try:
@@ -739,6 +752,67 @@ def recent_sensor(garden_key: str, sensor_type: str = "soil_moisture",
         finally:
             conn.close()
     except Exception:  # noqa: BLE001
+        return []
+
+
+def log_camera_alert(garden_key: str, alert_date: str, title: str, content: str,
+                     level: str = "low", actions_text: str = "",
+                     image_b64: str = "") -> None:
+    """写入一条摄像头监测预警（每日推送）。数据库不可用时降级跳过。"""
+    try:
+        conn = connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO camera_alert_log (garden_key,alert_date,title,content,level,"
+                    "actions_text,image_base64) VALUES (%s,%s,%s,%s,%s,%s,%s)",
+                    (garden_key, alert_date, title, content, level, actions_text, image_b64),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as e:  # noqa: BLE001
+        print(f"[db] log_camera_alert 失败: {e}")
+
+
+def latest_camera_alert(garden_key: str) -> dict | None:
+    """返回最近一条摄像头监测预警（含画面）。无记录返回 None。"""
+    try:
+        conn = connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id,alert_date,title,content,level,actions_text,image_base64,created_at "
+                    "FROM camera_alert_log WHERE garden_key=%s "
+                    "ORDER BY id DESC LIMIT 1",
+                    (garden_key,),
+                )
+                row = cur.fetchone()
+                return dict(row) if row else None
+        finally:
+            conn.close()
+    except Exception as e:  # noqa: BLE001
+        print(f"[db] latest_camera_alert 失败: {e}")
+        return None
+
+
+def camera_alert_history(garden_key: str, limit: int = 30) -> list[dict]:
+    """返回摄像头监测预警历史（不含大图 base64，避免响应过大）。"""
+    try:
+        conn = connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id,alert_date,title,content,level,actions_text,created_at "
+                    "FROM camera_alert_log WHERE garden_key=%s "
+                    "ORDER BY id DESC LIMIT %s",
+                    (garden_key, limit),
+                )
+                return [dict(r) for r in cur.fetchall()]
+        finally:
+            conn.close()
+    except Exception as e:  # noqa: BLE001
+        print(f"[db] camera_alert_history 失败: {e}")
         return []
 
 
