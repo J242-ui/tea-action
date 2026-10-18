@@ -49,3 +49,18 @@ def test_predict_over_daily_returns_structure():
     assert res["overall_level"] in ("low", "medium", "high")
     assert len(res["per_day"]) == 2
     assert set(res["proba"].keys()) == {"low", "medium", "high"}
+
+
+def test_predict_maps_sparse_model_classes_without_index_error():
+    class FakeModel:
+        classes_ = [0, 2]
+
+        @staticmethod
+        def predict_proba(_):
+            return [[0.6, 0.4]]
+
+    c = RiskClassifier()
+    c._model = FakeModel()
+    proba = c.predict([30.0, 18.0, 70.0, 2.0, 3.0, 200.0, 0.0, 4.0])
+
+    assert proba == {"low": 0.6, "medium": 0.0, "high": 0.4}

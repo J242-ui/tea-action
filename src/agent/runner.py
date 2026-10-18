@@ -36,6 +36,8 @@ class AgentRunner:
         self._thread: threading.Thread | None = None
         self._stop_evt = threading.Event()
         self._lock = threading.Lock()
+        # REST 手动单步与后台循环可能同时触发，整轮硬件/决策操作必须串行。
+        self._step_lock = threading.Lock()
         self._listeners: list[Callable[[dict], None]] = []
         self.running = False
         self.steps = 0
@@ -74,6 +76,10 @@ class AgentRunner:
         with self._lock:
             if self.running:
                 return False
+            # 上一个循环线程还卡在采集/推理里未退出时拒绝再启动，
+            # 避免两个线程并发抢摄像头/推理导致越卡越死
+            if self._thread is not None and self._thread.is_alive():
+                return False
             self.running = True
             self._stop_evt.clear()
             self._thread = threading.Thread(target=self._loop, daemon=True,
@@ -88,6 +94,8 @@ class AgentRunner:
             self.running = False
             self._stop_evt.set()
         if self._thread is not None:
+            # 线程卡在不可中断的采集调用（摄像头句柄阻塞）时最多等 5 秒；
+            # 即使 join 超时，stop 标记已置位，线程会在下一轮循环入口退出
             self._thread.join(timeout=5)
         return True
 
@@ -152,6 +160,11 @@ class AgentRunner:
     # ---------- 单轮决策 ----------
     def step(self) -> dict:
         """执行一轮完整决策，返回并广播最新状态快照。"""
+        with self._step_lock:
+            return self._step_once()
+
+    def _step_once(self) -> dict:
+        """串行执行一次完整流程（由 step() 持锁调用）。"""
         garden = self._garden()
 
         # 1) 传感器
@@ -181,7 +194,12 @@ class AgentRunner:
 
         # 5) 执行
         events = bus.apply(decision["actions"])
-        bus.auto_timeout_check()
+        timeout_events = bus.auto_timeout_check()
+        events.extend(timeout_events)
+        for event in timeout_events:
+            if event.get("device") == "spray_boom" and event.get("operation") == "off":
+                # 自动停止也属于一次喷雾结束，需进入冷却期。
+                self._decision_state["last_spray_end_at"] = event.get("ts")
 
         # 5.1) 灌溉响应：阀门开启时土壤湿度逐步回升（模拟滴灌回水），
         #      达到 IRRIGATE_STOP 后 Agent 会自动关阀 —— 形成「缺水→灌溉→回水→停灌」闭环

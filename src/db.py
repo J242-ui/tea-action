@@ -6,9 +6,11 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import os
 import secrets
+import threading
 import time
 from datetime import datetime
 from typing import Any, Iterable
@@ -28,7 +30,8 @@ DB_CONFIG = dict(
     host=_cfg("DB_HOST", "127.0.0.1"),
     port=int(_cfg("DB_PORT", "3306")),
     user=_cfg("DB_USER", "root"),
-    password=_cfg("DB_PASSWORD", "1006"),
+    # 不在代码中内置真实密码；本地空密码账号可显式配置为空字符串。
+    password=_cfg("DB_PASSWORD", ""),
     database=_cfg("DB_NAME", "tea_garden"),
     charset="utf8mb4",
     cursorclass=DictCursor,
@@ -143,8 +146,11 @@ def register(username: str, password: str, nickname: str | None = None) -> tuple
             )
         conn.commit()
         return True, "注册成功"
-    except Exception as e:  # noqa: BLE001
-        return False, f"注册失败：{e}"
+    except pymysql.err.IntegrityError:
+        # SELECT 与 INSERT 之间仍可能被并发注册抢占，唯一索引是最终防线。
+        return False, "用户名已存在"
+    except pymysql.MySQLError:
+        return False, "注册失败，请稍后重试"
     finally:
         conn.close()
 
@@ -155,30 +161,43 @@ def register(username: str, password: str, nickname: str | None = None) -> tuple
 _LOGIN_FAILURES: dict[str, list[float]] = {}  # username -> 失败时间戳
 _LOGIN_MAX_FAIL = 5          # 窗口内最多允许失败次数
 _LOGIN_WINDOW = 900          # 窗口时长（秒）= 15 分钟
+_LOGIN_LOCK = threading.Lock()
+_DUMMY_SALT = "00000000000000000000000000000000"
 
 
 def _record_login_failure(username: str) -> None:
-    _LOGIN_FAILURES.setdefault(username, []).append(time.time())
+    with _LOGIN_LOCK:
+        _LOGIN_FAILURES.setdefault(username, []).append(time.time())
 
 
 def _is_login_locked(username: str) -> bool:
-    now = time.time()
-    ts = [t for t in _LOGIN_FAILURES.get(username, []) if now - t < _LOGIN_WINDOW]
-    _LOGIN_FAILURES[username] = ts
-    return len(ts) >= _LOGIN_MAX_FAIL
+    with _LOGIN_LOCK:
+        now = time.time()
+        ts = [t for t in _LOGIN_FAILURES.get(username, []) if now - t < _LOGIN_WINDOW]
+        if ts:
+            _LOGIN_FAILURES[username] = ts
+        else:
+            _LOGIN_FAILURES.pop(username, None)
+        return len(ts) >= _LOGIN_MAX_FAIL
 
 
 def login_remaining_lock(username: str) -> int | None:
     """返回该用户名距离锁定还剩几次失败机会；已锁定返回 None。"""
-    now = time.time()
-    ts = [t for t in _LOGIN_FAILURES.get(username, []) if now - t < _LOGIN_WINDOW]
-    if len(ts) >= _LOGIN_MAX_FAIL:
-        return None
-    return _LOGIN_MAX_FAIL - len(ts)
+    username = (username or "").strip()
+    with _LOGIN_LOCK:
+        now = time.time()
+        ts = [t for t in _LOGIN_FAILURES.get(username, []) if now - t < _LOGIN_WINDOW]
+        if ts:
+            _LOGIN_FAILURES[username] = ts
+        else:
+            _LOGIN_FAILURES.pop(username, None)
+        if len(ts) >= _LOGIN_MAX_FAIL:
+            return None
+        return _LOGIN_MAX_FAIL - len(ts)
 
 
 def verify_login(username: str, password: str) -> dict | None:
-    """校验登录。成功返回用户 dict，失败返回 None（失败次数过多会临时锁定）。"""
+    """校验登录。成功返回可安全放入 session_state 的用户 dict。"""
     uname = (username or "").strip()
     if _is_login_locked(uname):
         return None
@@ -187,16 +206,21 @@ def verify_login(username: str, password: str) -> dict | None:
         with conn.cursor() as cur:
             cur.execute("SELECT * FROM users WHERE username=%s", (uname,))
             row = cur.fetchone()
-            if not row:
+            # 用户不存在时也执行一次同成本哈希，降低通过响应时间枚举用户名的风险。
+            salt = row["salt"] if row else _DUMMY_SALT
+            candidate = _hash_password(password or "", salt)
+            if not row or not hmac.compare_digest(candidate, row["password_hash"]):
                 _record_login_failure(uname)
                 return None
-            h = _hash_password(password, row["salt"])
-            if h != row["password_hash"]:
-                _record_login_failure(uname)
-                return None
-            # 登录成功：清零该用户名的失败记录
-            _LOGIN_FAILURES.pop(uname, None)
-            return dict(row)
+            with _LOGIN_LOCK:
+                _LOGIN_FAILURES.pop(uname, None)
+            # 密码哈希与盐只在服务端校验时使用，不能进入 Streamlit 会话状态。
+            return {
+                "id": row["id"],
+                "username": row["username"],
+                "nickname": row.get("nickname"),
+                "created_at": row.get("created_at"),
+            }
     finally:
         conn.close()
 
@@ -233,16 +257,23 @@ def add_garden(user_id: int, g: dict) -> tuple[bool, str]:
         conn.close()
 
 
-def update_garden(garden_id: int, g: dict) -> tuple[bool, str]:
+def update_garden(garden_id: int, user_id: int, g: dict) -> tuple[bool, str]:
+    """更新茶园；所有权条件写入 SQL，避免通过伪造 garden_id 越权修改。"""
     conn = connect()
     try:
         with conn.cursor() as cur:
             cur.execute(
                 """UPDATE gardens SET name=%s, location=%s, location_id=%s, lon=%s, lat=%s,
-                   altitude_m=%s, variety=%s, notes=%s WHERE id=%s""",
+                   altitude_m=%s, variety=%s, notes=%s WHERE id=%s AND owner_id=%s""",
                 (g["name"], g.get("location"), g.get("location_id"), g.get("lon"), g.get("lat"),
-                 g.get("altitude_m"), g.get("variety"), g.get("notes"), garden_id),
+                 g.get("altitude_m"), g.get("variety"), g.get("notes"), garden_id, user_id),
             )
+            changed = cur.rowcount
+            if not changed:
+                # 提交相同值也可能 rowcount=0，需要再确认记录是否属于当前用户。
+                cur.execute("SELECT id FROM gardens WHERE id=%s AND owner_id=%s", (garden_id, user_id))
+                if cur.fetchone() is None:
+                    return False, "茶园不存在或无权修改"
         conn.commit()
         return True, "已更新"
     except Exception as e:  # noqa: BLE001
@@ -251,12 +282,17 @@ def update_garden(garden_id: int, g: dict) -> tuple[bool, str]:
         conn.close()
 
 
-def delete_garden(garden_id: int) -> None:
+def delete_garden(garden_id: int, user_id: int) -> tuple[bool, str]:
+    """删除当前用户自己的茶园，不能仅凭 garden_id 删除他人数据。"""
     conn = connect()
     try:
         with conn.cursor() as cur:
-            cur.execute("DELETE FROM gardens WHERE id=%s", (garden_id,))
+            cur.execute("DELETE FROM gardens WHERE id=%s AND owner_id=%s", (garden_id, user_id))
+            deleted = cur.rowcount
         conn.commit()
+        if not deleted:
+            return False, "茶园不存在或无权删除"
+        return True, "茶园已删除"
     finally:
         conn.close()
 
@@ -480,12 +516,17 @@ CREATE TABLE IF NOT EXISTS agent_decision_log (
         conn.close()
 
 
-def init_db_ext() -> None:
-    """调用方在启动时调用，确保新表存在。"""
+def init_db_ext(strict: bool = False) -> None:
+    """确保扩展表存在。
+
+    Web 页面使用默认的非严格模式，数据库不可用时仍可游客演示；
+    定时任务等必须感知失败的后台流程应传 strict=True。
+    """
     try:
         _extend_schema()
     except Exception:  # noqa: BLE001 - 数据库不可用时静默，游客演示不受影响
-        pass
+        if strict:
+            raise
 
 
 # ----------------------------------------------------------------
@@ -532,6 +573,20 @@ def weather_history_series(garden_key: str, days: int = 90) -> list[dict]:
             rows = [dict(r) for r in cur.fetchall()]
         rows.reverse()
         return rows
+    finally:
+        conn.close()
+
+
+def weather_history_has_date(garden_key: str, obs_date) -> bool:
+    """判断某茶园某天是否已归档，避免每次页面渲染重复写入整段预报。"""
+    conn = connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT 1 FROM weather_history WHERE garden_key=%s AND obs_date=%s LIMIT 1",
+                (garden_key, obs_date),
+            )
+            return cur.fetchone() is not None
     finally:
         conn.close()
 
@@ -769,9 +824,9 @@ def agent_decision_history(garden_key: str, limit: int = 30) -> list[dict]:
             for r in rows:
                 for k, jk in (("inputs_json", "inputs"), ("actions_json", "actions")):
                     try:
-                        r[k] = json.loads(r.get(jk) or "null")
+                        r[jk] = json.loads(r.get(k) or "null")
                     except Exception:  # noqa: BLE001
-                        r[k] = None
+                        r[jk] = None
             return rows
         finally:
             conn.close()

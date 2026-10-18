@@ -69,12 +69,14 @@ if _ens_f is not None:
         _f1, _f2 = st.columns(2)
         if _f1.button("👍 采纳这条建议", key="farm_fb_ok"):
             ensemble.record_feedback(garden, now, _ens_f["proba"], _lv,
-                                     kind="farm", adopted=True, detail="采纳智能推荐")
+                                     kind="farm", adopted=True, detail="采纳智能推荐",
+                                     user_id=(current_user() or {}).get("id"))
             st.success("已记录采纳，感谢反馈")
             st.rerun()
         if _f2.button("👎 不采纳", key="farm_fb_no"):
             ensemble.record_feedback(garden, now, _ens_f["proba"], _lv,
-                                     kind="farm", adopted=False, detail="未采纳")
+                                     kind="farm", adopted=False, detail="未采纳",
+                                     user_id=(current_user() or {}).get("id"))
             st.success("已记录，将减少此类推荐")
             st.rerun()
 
@@ -186,15 +188,31 @@ _qf_farm = _QfFarm()
 st.markdown("### 大模型农事研判")
 if _qf_farm.demo:
     st.caption("提示：演示模式（未配置 QIANFAN_API_KEY），下方为占位演示；配置密钥后调用真实千帆大模型。")
-with st.spinner("正在调用大模型研判天气与农事建议……"):
-    try:
-        _sys_farm = "你是茶园农业专家，结合天气快照给出近几日可操作的农事建议，分条编号、简明中文。"
-        _usr_farm = "请研判农事操作建议（浇水/施肥/打药/采摘与物候等），聚焦日常田间作业，不要罗列灾害预警；3-6条。" + _snap_farm
-        _adv_farm = _qf_farm.chat([{"role":"system","content":_sys_farm},{"role":"user","content":_usr_farm}], temperature=0.5, max_tokens=1200)
-    except Exception as _e_farm:
-        _adv_farm = "调用大模型研判失败：" + str(_e_farm)
-with st.container(border=True):
-    st.caption("数据来源：实时天气 + 未来预报 · 千帆大模型研判（叠加参考，不与风险预警冲突）")
-    st.write(_adv_farm)
+if st.button("生成大模型农事研判", key="farm_llm_generate"):
+    with st.spinner("正在调用大模型研判天气与农事建议……"):
+        try:
+            _sys_farm = "你是茶园农业专家，结合天气快照给出近几日可操作的农事建议，分条编号、简明中文。"
+            _usr_farm = (
+                "请研判农事操作建议（浇水/施肥/打药/采摘与物候等），"
+                "聚焦日常田间作业，不要罗列灾害预警；3-6条。" + _snap_farm
+            )
+            _adv_farm = _qf_farm.chat(
+                [{"role": "system", "content": _sys_farm},
+                 {"role": "user", "content": _usr_farm}],
+                temperature=0.5,
+                max_tokens=1200,
+            )
+        except Exception as _e_farm:
+            _adv_farm = "调用大模型研判失败：" + str(_e_farm)
+    st.session_state["farm_llm_result"] = {
+        "garden_key": garden["key"],
+        "text": _adv_farm,
+    }
+
+_llm_result = st.session_state.get("farm_llm_result") or {}
+if _llm_result.get("garden_key") == garden["key"] and _llm_result.get("text"):
+    with st.container(border=True):
+        st.caption("数据来源：实时天气 + 未来预报 · 千帆大模型研判（叠加参考，不与风险预警冲突）")
+        st.write(_llm_result["text"])
 
 # ===== 大模型研判叠加块结束 =====

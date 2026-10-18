@@ -45,6 +45,18 @@ def _gkey(garden: dict) -> str:
     return garden.get("key") or garden.get("id") or "longjing"
 
 
+def _daily_rows(data: dict | None) -> list[dict]:
+    """兼容和风原始响应与页面包装后的嵌套响应，返回有效逐日预报。"""
+    if not isinstance(data, dict):
+        return []
+    rows = data.get("daily", [])
+    if isinstance(rows, dict):
+        rows = rows.get("daily", [])
+    if not isinstance(rows, list):
+        return []
+    return [d for d in rows if isinstance(d, dict) and d.get("fxDate")]
+
+
 # ---------------------------------------------------------------------------
 # 数据打底
 # ---------------------------------------------------------------------------
@@ -55,23 +67,22 @@ def ensure_data(garden: dict) -> int:
     return db.weather_history_count(key)
 
 
-def archive_today(garden: dict, data: dict) -> None:
+def archive_today(garden: dict, data: dict) -> int:
     """把和风今日返回的 daily 预报归档进历史表（供后续时序/训练用）。
 
     每天每个茶园只归档一次：若 weather_history 已有今天记录则跳过，
-    避免页面每次渲染都重复 UPSERT（降低写库与数据冗余）。
+    避免页面每次渲染都重复 UPSERT（降低写库与数据冗余）。返回本次写入天数。
     """
-    try:
-        daily = data.get("daily", {}).get("daily", [])
-        if not daily:
-            return
-        # 今日已归档则跳过
-        recent = db.weather_history_series(_gkey(garden), days=1)
-        if recent and str(recent[0]["obs_date"]) == date.today().isoformat():
-            return
-        db.archive_weather(_gkey(garden), daily)
-    except Exception:  # noqa: BLE001
-        pass
+    daily = _daily_rows(data)
+    if not daily:
+        return 0
+    key = _gkey(garden)
+    today = date.today().isoformat()
+    # 预报会同时写入未来多天，不能只检查“日期最大的一条”是否等于今天。
+    if db.weather_history_has_date(key, today):
+        return 0
+    db.archive_weather(key, daily)
+    return len(daily)
 
 
 def prepare(garden: dict, data: dict | None = None) -> dict:

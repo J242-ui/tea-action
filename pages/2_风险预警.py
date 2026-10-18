@@ -73,11 +73,17 @@ if _ens is not None:
         st.info(_act["advice"])
         c_fb1, c_fb2 = st.columns(2)
         if c_fb1.button("✅ 已按建议处置", key="fb_act"):
-            ensemble.record_feedback(garden, now, _ens["proba"], _lv, adopted=True, detail="已处置")
+            ensemble.record_feedback(
+                garden, now, _ens["proba"], _lv, adopted=True, detail="已处置",
+                user_id=(current_user() or {}).get("id"),
+            )
             st.success("已记录反馈，Bandit 将据此优化后续推荐")
             st.rerun()
         if c_fb2.button("😌 风险未发生 / 已解除", key="fb_low"):
-            ensemble.record_feedback(garden, now, _ens["proba"], _lv, actual_level="low", detail="风险未发生")
+            ensemble.record_feedback(
+                garden, now, _ens["proba"], _lv, actual_level="low", detail="风险未发生",
+                user_id=(current_user() or {}).get("id"),
+            )
             st.success("已记录反馈（成真=低风险），用于评估推荐有效性")
             st.rerun()
 

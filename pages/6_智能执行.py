@@ -8,6 +8,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import time
 from datetime import datetime
 
 import pandas as pd
@@ -79,7 +80,7 @@ def _render_live_frame() -> None:
     f = _api("/api/frame", timeout=3)
     img, src, ts = f.get("image"), f.get("source", "demo_frame"), f.get("ts", "")
     if img:
-        st.image(img, use_container_width=True)
+        st.image(img, width="stretch")
         src_txt = "USB摄像头实拍" if src == "usb_cam" else "演示帧（摄像头不可用）"
         suffix = f" ｜ 帧时间 {str(ts)[11:19]}" if ts else ""
         st.caption(f"实时画面 · 来源：{src_txt}{suffix}")
@@ -98,14 +99,19 @@ def _start_ws_service() -> bool:
             stderr=subprocess.DEVNULL,
             creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
         )
-        return True
+        # Popen 成功只代表进程已创建；等待健康检查通过，避免页面立即重绘时误判未启动。
+        for _ in range(20):
+            if ws_alive():
+                return True
+            time.sleep(0.25)
+        st.error("WS 服务已启动但健康检查超时，请查看日志或稍后重试")
+        return False
     except Exception as e:  # noqa: BLE001
         st.error(f"启动 WS 服务失败：{e}")
         return False
 
 
 def main() -> None:
-    st.set_page_config(page_title="智能执行", page_icon="🤖", layout="wide")
     ui.inject_css()
 
     st.title("🤖 智能执行（Agent 控制台）")
@@ -122,10 +128,8 @@ def main() -> None:
     with c1:
         if st.button("🚀 启动 WS 服务（动态网页）", type="primary", width="stretch",
                      disabled=alive):
-            pass
-        if not alive and st.button("🛠 一键启动 WS 服务", width="stretch"):
-            _start_ws_service()
-            st.rerun()
+            if _start_ws_service():
+                st.rerun()
     with c2:
         if alive and st.button("▶️ 启动 Agent 主循环", type="primary", width="stretch"):
             r = _api("/api/agent/start", "POST")
@@ -153,7 +157,7 @@ def main() -> None:
     st.divider()
     st.markdown("### ⏱ 刷新设置")
     st.caption(
-        "「持续录像」：画面连续推送（约 0.2 秒/帧，适合观察实时画面）；「自定义刷新时间」："
+        "「持续录像」：画面约每 0.5 秒推送一帧（适合观察实时画面）；「自定义刷新时间」："
         "整轮（采集→推理→决策→推送）按设定间隔执行。间隔越小 CPU 占用越高，最小 0.5 秒。"
     )
     r1, r2, r3 = st.columns([2, 2, 1])

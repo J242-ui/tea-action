@@ -13,7 +13,6 @@ from src import backtest, config, db, ensemble, ml_risk, ui
 
 
 def main() -> None:
-    st.set_page_config(page_title="开发者控制台", page_icon="🛠", layout="wide")
     ui.inject_css()
 
     # 启动时确保扩展表（含 model_eval_log）已建

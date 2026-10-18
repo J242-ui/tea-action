@@ -10,6 +10,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import random
 from datetime import date, timedelta
 from pathlib import Path
@@ -71,7 +72,9 @@ def seed_history(garden_key: str, garden: dict, days: int = 180, seed: int = 7) 
     """
     if db.weather_history_count(garden_key) >= 30:
         return 0
-    rng = random.Random(hash((garden_key, seed)) % (2**32))
+    # Python 内置 hash 带随机化，跨进程不可复现；使用稳定摘要生成演示历史种子。
+    digest = hashlib.sha256(f"{garden_key}:{seed}".encode("utf-8")).digest()
+    rng = random.Random(int.from_bytes(digest[:8], "big"))
     altitude = float(garden.get("altitude_m") or 200)
     base = 14.0 + altitude / 400.0  # 海拔越高基准温越低
     rows: list[dict] = []
@@ -146,7 +149,9 @@ class RiskClassifier:
         return X, y
 
     def _fit(self, X: list, y: list) -> bool:
-        if len(X) < 30 or len(set(y)) < 2:
+        # 三分类模型必须看到三个等级；只有两类时训练出列数不稳定的模型，
+        # 后续按固定索引取 high 概率会越界，因此宁可保持未就绪并继续积累数据。
+        if len(X) < 30 or len(set(y)) < 3:
             return False
         from lightgbm import LGBMClassifier
         from sklearn.preprocessing import StandardScaler
@@ -185,7 +190,15 @@ class RiskClassifier:
         if not self.ready:
             return {lv: 1.0 / 3 for lv in LEVELS}
         proba = self._model.predict_proba([features])[0]
-        return {lv: float(proba[_LEVEL_IDX[lv]]) for lv in LEVELS}
+        classes = getattr(self._model, "classes_", None)
+        if classes is None:
+            return {lv: 1.0 / 3 for lv in LEVELS}
+        class_positions = {int(cls): i for i, cls in enumerate(classes)}
+        return {
+            lv: float(proba[class_positions[_LEVEL_IDX[lv]]])
+            if _LEVEL_IDX[lv] in class_positions else 0.0
+            for lv in LEVELS
+        }
 
     def predict_over_daily(self, daily: list[dict], garden: dict) -> dict:
         """对未来每天的预报逐日预测风险等级，返回：

@@ -44,6 +44,7 @@ class TeaAgentASGI:
         self.clients: list = []
         self.loop: asyncio.AbstractEventLoop | None = None
         self._reaper_task: asyncio.Task | None = None
+        self._runner_subscribed = False
 
     # ---------- ASGI 入口 ----------
     async def __call__(self, scope, receive, send):
@@ -59,7 +60,9 @@ class TeaAgentASGI:
             msg = await receive()
             if msg["type"] == "lifespan.startup":
                 self.loop = asyncio.get_running_loop()
-                runner.subscribe(self._broadcast)
+                if not self._runner_subscribed:
+                    runner.subscribe(self._broadcast)
+                    self._runner_subscribed = True
                 # 僵尸连接清理任务：无心跳超过 60 秒的 WS 客户端直接踢出，
                 # 防止主站页面反复刷新/会话残留导致 clients 无限累积、广播变慢。
                 # 必须保存任务引用，否则会被事件循环垃圾回收导致清理永不运行
@@ -101,6 +104,7 @@ class TeaAgentASGI:
                     # 限时发送：慢/死连接不阻塞事件循环（取消后该连接视为失效移除）
                     await asyncio.wait_for(
                         ws["send"]({"type": "websocket.send", "text": payload}), timeout=0.5)
+                    ws["last_seen"] = time.monotonic()
                 except Exception:  # noqa: BLE001
                     try:
                         self.clients.remove(ws)

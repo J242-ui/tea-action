@@ -9,8 +9,9 @@ import io
 import os
 import sys
 import traceback
+from pathlib import Path
 
-ROOT = r"C:\Users\Lenovo\Desktop\项目文件"
+ROOT = str(Path(__file__).resolve().parent)
 sys.path.insert(0, ROOT)
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 
@@ -182,7 +183,8 @@ def test_vision():
     assert isinstance(res.get("detections"), list)
     assert res.get("summary") and res["summary"]["total"] == len(res["detections"])
     b64 = annotate.frame_to_base64(annotate.draw_detections(frame, res))
-    assert b64.startswith("data:image/jpeg;base64,")
+    # 无 OpenCV 时编码器会降级为 PNG，浏览器同样可直接显示。
+    assert b64.startswith(("data:image/jpeg;base64,", "data:image/png;base64,"))
 
 
 @t("sensor: 土壤湿度模拟器")

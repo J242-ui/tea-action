@@ -40,7 +40,7 @@ def main() -> int:
     # 1) 初始化数据库
     try:
         db.init_db()
-        db.init_db_ext()
+        db.init_db_ext(strict=True)
     except Exception as e:  # noqa: BLE001
         log.error("数据库初始化失败: %s", e)
         print("ERROR: 数据库初始化失败，无法继续归档/重训。")
@@ -58,9 +58,12 @@ def main() -> int:
                 log.warning("[%s] 缺少 location_id/经纬度，跳过归档", g["name"])
                 continue
             data = client.get_forecast(loc, days=7)
-            ensemble.archive_today(g, data)
-            archived += 1
-            log.info("[%s] 今日预报已归档", g["name"])
+            written = ensemble.archive_today(g, data)
+            if written:
+                archived += 1
+                log.info("[%s] 今日预报已归档 %s 天", g["name"], written)
+            else:
+                log.info("[%s] 今日预报已存在或为空，跳过写入", g["name"])
         except Exception as e:  # noqa: BLE001
             log.error("[%s] 归档失败: %s", g["name"], e)
 

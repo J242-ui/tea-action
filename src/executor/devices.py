@@ -38,6 +38,7 @@ class DripValve:
         self.since = _ts()
         self.flow_rate = 0.0
         self.duration_min: float | None = None
+        self._started_monotonic: float | None = None
 
     def open(self, duration_min: float | None = None, reason: str = "") -> dict:
         if self.state == "open":
@@ -46,6 +47,7 @@ class DripValve:
         self.since = _ts()
         self.flow_rate = DRIP_FLOW_RATE_LH
         self.duration_min = duration_min
+        self._started_monotonic = time.monotonic()
         return self.event("open", reason, duration_min)
 
     def close(self, reason: str = "") -> dict:
@@ -55,6 +57,7 @@ class DripValve:
         self.since = _ts()
         self.flow_rate = 0.0
         self.duration_min = None
+        self._started_monotonic = None
         return self.event("close", reason, None)
 
     def event(self, operation: str, reason: str, duration_min: float | None) -> dict:
@@ -87,6 +90,7 @@ class SprayBoom:
         self.since = _ts()
         self.nozzle_pressure = 0.0
         self.duration_min: float | None = None
+        self._started_monotonic: float | None = None
 
     def on(self, duration_min: float | None = None, reason: str = "") -> dict:
         if self.state == "on":
@@ -95,6 +99,7 @@ class SprayBoom:
         self.since = _ts()
         self.nozzle_pressure = SPRAY_PRESSURE_BAR
         self.duration_min = duration_min
+        self._started_monotonic = time.monotonic()
         return self.event("on", reason, duration_min)
 
     def off(self, reason: str = "") -> dict:
@@ -104,6 +109,7 @@ class SprayBoom:
         self.since = _ts()
         self.nozzle_pressure = 0.0
         self.duration_min = None
+        self._started_monotonic = None
         return self.event("off", reason, None)
 
     def event(self, operation: str, reason: str, duration_min: float | None) -> dict:
@@ -183,18 +189,28 @@ class ActuatorBus:
             self.devices["spray_boom"].off("系统复位")
 
     def auto_timeout_check(self, max_minutes: float = 30.0) -> list[dict]:
-        """安全检查：超时自动停止（防止演示中执行器卡在开启状态）。"""
+        """安全检查：达到计划时长或全局安全上限时自动停止。
+
+        max_minutes 是兜底上限，不应当延长设备请求的较短计划时长：
+        duration_min=10 时应运行约 10 分钟，而不是被 max_minutes=30 拖到 30 分钟。
+        """
         events: list[dict] = []
         with self._lock:
             for name, dev in self.devices.items():
                 state = dev.state
                 active = (state == "open" and name == "drip_valve") or \
                          (state == "on" and name == "spray_boom")
-                if not active or not dev.duration_min:
+                if not active:
                     continue
-                elapsed_min = (_now_epoch() - time.mktime(
-                    datetime.fromisoformat(dev.since).timetuple())) / 60.0
-                if elapsed_min >= max(dev.duration_min, max_minutes):
+                started = getattr(dev, "_started_monotonic", None)
+                if started is None:
+                    started = datetime.fromisoformat(dev.since).timestamp()
+                    elapsed_min = (_now_epoch() - started) / 60.0
+                else:
+                    elapsed_min = (time.monotonic() - started) / 60.0
+                requested = float(dev.duration_min) if dev.duration_min else float(max_minutes)
+                limit = min(max(requested, 0.01), float(max_minutes))
+                if elapsed_min >= limit:
                     ev = dev.close(f"自动停止（已运行 {elapsed_min:.0f} 分钟）") \
                         if name == "drip_valve" else dev.off(f"自动停止（已运行 {elapsed_min:.0f} 分钟）")
                     events.append(ev)

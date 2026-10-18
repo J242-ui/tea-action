@@ -408,6 +408,12 @@ function connect() {
   ws.onerror = () => ws.close();
 }
 connect();
+// 应用层心跳：浏览器协议层 ping 不一定传给 ASGI，服务端僵尸清理需要可观察消息。
+setInterval(() => {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: "heartbeat" }));
+  }
+}, 20000);
 </script>
 </body>
 </html>

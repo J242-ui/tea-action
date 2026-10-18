@@ -173,25 +173,52 @@ class CameraCapture:
         # 快速降级：确认所有后端都打不开摄像头后，一段时间内不再反复重建句柄
         #（cv2.VideoCapture 在无设备/占用时可能阻塞数秒，反复重试会把 Agent 每轮都拖慢）
         self._fail_fast_until = 0.0
-        self._open()
+        # 惰性打开：初始化时不抢占摄像头（8510 服务导入、Agent 未启动时摄像头保持空闲），
+        # 首次 read_frame() 才尝试打开，避免服务启动就占用摄像头
 
-    def _try_open_backend(self, backend) -> object | None:
-        """尝试用指定后端打开摄像头；构造可能阻塞，由调用方限时。"""
+    def _try_open_backend(self, backend, holder: dict | None = None) -> object | None:
+        """尝试用指定后端打开并验证能读到一帧有效画面；返回可用句柄或 None。
+
+        仅构造成功不算数——MSMF 在设备被占用时 isOpened()=True 但 read() 无限阻塞，
+        必须在限时线程内完成「构造→试读→非黑」验证，坏后端直接弃用换下一个。
+        holder 用于在超时后让调用方拿到尚未返回的句柄并主动释放。
+        """
         import cv2
+        cap = None
         try:
-            return cv2.VideoCapture(self.index, backend)
+            cap = cv2.VideoCapture(self.index, backend)
         except Exception:  # noqa: BLE001
             try:
-                return cv2.VideoCapture(self.index)
+                cap = cv2.VideoCapture(self.index)
             except Exception:  # noqa: BLE001
                 return None
+        if holder is not None:
+            holder["cap"] = cap
+        if cap is None or not cap.isOpened():
+            self._release_cap(cap)
+            return None
+        # 试读验证：读不到有效帧（黑帧/阻塞）的后端立即弃用并释放
+        try:
+            ok, frame = cap.read()
+            if ok and frame is not None and frame.size > 0 and float(frame.mean()) >= self._BLACK_FRAME_MEAN:
+                return cap
+        except Exception:  # noqa: BLE001
+            pass
+        self._release_cap(cap)
+        return None
+
+    @staticmethod
+    def _release_cap(cap) -> None:
+        """限时释放句柄，避免坏驱动在 release() 中再次阻塞调用线程。"""
+        if cap is None:
+            return
+        _run_with_timeout(lambda: cap.release(), 1.0, None)
 
     def _open(self) -> None:
         """按「原生后端优先」顺序打开摄像头：MSMF(Windows) → DSHOW → 默认。
 
-        Windows 上 OpenCV 默认 FFMPEG 后端打开摄像头不稳定（黑帧/失败），
-        显式使用 Media Foundation / DirectShow 更可靠。
-        每个后端构造限时 3 秒（句柄异常时 cv2.VideoCapture 可能无限阻塞）。
+        所有后端共享 4 秒总预算，每个后端在限时线程内完成「构造→试读验证」
+        （句柄异常时 cv2.VideoCapture/read 可能无限阻塞，超时即弃用该后端）。
         成功打开后清除快速降级标记；全部失败则进入快速降级。
         """
         try:
@@ -201,17 +228,33 @@ class CameraCapture:
                 if hasattr(cv2, name):
                     backends.append(getattr(cv2, name))
             backends.append(cv2.CAP_ANY)
+            deadline = time.monotonic() + 4.0
             for backend in backends:
-                cap = _run_with_timeout(lambda b=backend: self._try_open_backend(b), 3.0, None)
-                if cap is not None and cap.isOpened():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                holder: dict = {}
+                cap = _run_with_timeout(
+                    lambda b=backend, h=holder: self._try_open_backend(b, h),
+                    remaining,
+                    None,
+                )
+                if cap is not None:
                     self._cap = cap
                     self._fail_fast_until = 0.0
                     return
+                # 超时后工作线程可能仍卡在 read()，主动释放它创建的句柄。
+                self._release_cap(holder.get("cap"))
         except Exception:  # noqa: BLE001
             pass
         self._cap = None
         # 进入快速降级窗口（60 秒内不再重试，之后自动再尝试一次，便于中途插入摄像头）
         self._fail_fast_until = time.monotonic() + 60.0
+
+    def _ensure_open(self) -> None:
+        """惰性打开：无句柄且不在快速降级窗口内时尝试打开摄像头。"""
+        if self._cap is None and time.monotonic() >= self._fail_fast_until:
+            self._open()
 
     @property
     def available(self) -> bool:
@@ -226,12 +269,12 @@ class CameraCapture:
         """
         if self._cap is None:
             return None
+        cap = self._cap
         holder: dict = {}
 
         def _do_read():
             try:
-                import cv2
-                ok, frame = self._cap.read()
+                ok, frame = cap.read()
                 holder["res"] = (ok, frame)
             except Exception as e:  # noqa: BLE001
                 holder["err"] = str(e)
@@ -240,6 +283,10 @@ class CameraCapture:
         t.start()
         t.join(timeout=1.5)
         if t.is_alive():
+            # 不能把仍在阻塞的句柄留给下一轮继续 read()：先摘除并异步释放，
+            # 后续由 read_frame() 重新打开摄像头。
+            self._cap = None
+            self._release_cap(cap)
             return None  # read 阻塞超时 → 上层重建句柄或快速降级
         if "err" in holder:
             return None
@@ -252,12 +299,14 @@ class CameraCapture:
     def read_frame(self) -> np.ndarray | None:
         """读取一帧 BGR 图像。
 
+        惰性打开：首次调用才尝试初始化摄像头。
         摄像头不可用，或读到无效（纯黑）帧时：
           1) 快速降级窗口内不重试，直接返回演示合成帧（避免无设备时每轮阻塞数秒）
           2) 窗口外（或句柄曾打开成功）先重新打开摄像头再试一次
         帧来源记录在 last_source：usb_cam / demo_frame。
         """
         with self._lock:
+            self._ensure_open()
             if time.monotonic() < self._fail_fast_until:
                 # 已确认摄像头不可用：不重试，直接降级演示帧
                 if self.fallback:
@@ -290,7 +339,7 @@ class CameraCapture:
             if self._cap is not None:
                 cap = self._cap
                 self._cap = None  # 先解除引用，避免阻塞期间其他逻辑复用坏句柄
-                _run_with_timeout(lambda: cap.release(), 1.0, None)
+                self._release_cap(cap)
 
 
 # 模块级单例（惰性创建，避免无摄像头环境启动报错）

@@ -54,8 +54,15 @@ def _collect(d: dict, prefix) -> dict:
 def _validate(g: dict) -> str | None:
     if not g["name"]:
         return "茶园名称不能为空"
-    if not g["location_id"] and (g["lon"] is None or g["lat"] is None):
+    lon, lat = g.get("lon"), g.get("lat")
+    has_coords = lon is not None and lat is not None
+    if not g["location_id"] and not has_coords:
         return "请填写 LocationID 或经纬度至少一项"
+    if has_coords:
+        if not -180 <= float(lon) <= 180 or not -90 <= float(lat) <= 90:
+            return "经纬度超出有效范围（经度 -180~180，纬度 -90~90）"
+        if abs(float(lon)) < 1e-6 and abs(float(lat)) < 1e-6:
+            return "经纬度不能同时为 0，请填写真实坐标或改用 LocationID"
     return None
 
 
@@ -72,9 +79,9 @@ with st.expander("➕ 添加新茶园", expanded=False):
         loc = st.text_input("所属地区（如：浙江省杭州市西湖区）", key="add_loc")
         lid = st.text_input("和风天气 LocationID（可留空，用下方经纬度）", key="add_locid")
         c3, c4, c5 = st.columns(3)
-        lon = c3.number_input("经度", key="add_lon", format="%.4f")
-        lat = c4.number_input("纬度", key="add_lat", format="%.4f")
-        alt = c5.number_input("海拔(m)", key="add_alt", format="%.1f")
+        lon = c3.number_input("经度", key="add_lon", format="%.4f", value=None, placeholder="如 120.1234")
+        lat = c4.number_input("纬度", key="add_lat", format="%.4f", value=None, placeholder="如 30.1234")
+        alt = c5.number_input("海拔(m)", key="add_alt", format="%.1f", value=None, placeholder="如 200")
         notes = st.text_area("备注", key="add_notes")
         submitted = st.form_submit_button("保存茶园")
     if submitted:
@@ -115,11 +122,14 @@ else:
                     st.session_state["edit_garden_id"] = g["id"] if not editing else None
                     st.rerun()
                 if st.button("🗑 删除", key=f"del_{g['id']}"):
-                    db.delete_garden(g["id"])
-                    if st.session_state.get("edit_garden_id") == g["id"]:
-                        st.session_state["edit_garden_id"] = None
-                    st.session_state.pop("garden_id", None)
-                    st.rerun()
+                    ok, msg = db.delete_garden(g["id"], user["id"])
+                    if ok:
+                        if st.session_state.get("edit_garden_id") == g["id"]:
+                            st.session_state["edit_garden_id"] = None
+                        st.session_state.pop("garden_id", None)
+                        st.rerun()
+                    else:
+                        st.error(msg)
 
             # ---- 编辑表单（内联） ----
             if editing:
@@ -131,9 +141,9 @@ else:
                     e_loc = st.text_input("所属地区", value=gd["location"], key=f"e_loc_{g['id']}")
                     e_lid = st.text_input("LocationID", value=gd["location_id"], key=f"e_lid_{g['id']}")
                     e3, e4, e5 = st.columns(3)
-                    e_lon = e3.number_input("经度", value=gd["lon"] or 0.0, format="%.4f", key=f"e_lon_{g['id']}")
-                    e_lat = e4.number_input("纬度", value=gd["lat"] or 0.0, format="%.4f", key=f"e_lat_{g['id']}")
-                    e_alt = e5.number_input("海拔(m)", value=gd["altitude_m"] or 0.0, format="%.1f", key=f"e_alt_{g['id']}")
+                    e_lon = e3.number_input("经度", value=gd["lon"], format="%.4f", key=f"e_lon_{g['id']}")
+                    e_lat = e4.number_input("纬度", value=gd["lat"], format="%.4f", key=f"e_lat_{g['id']}")
+                    e_alt = e5.number_input("海拔(m)", value=gd["altitude_m"], format="%.1f", key=f"e_alt_{g['id']}")
                     e_notes = st.text_area("备注", value=gd["notes"], key=f"e_notes_{g['id']}")
                     ec1, ec2 = st.columns(2)
                     submitted = ec1.form_submit_button("💾 保存修改", type="primary")
@@ -158,8 +168,11 @@ else:
                     if err:
                         st.error(err)
                     else:
-                        db.update_garden(g["id"], ng)
-                        st.session_state["edit_garden_id"] = None
-                        st.session_state.pop("garden_id", None)
-                        st.success("茶园已更新")
-                        st.rerun()
+                        ok, msg = db.update_garden(g["id"], user["id"], ng)
+                        if ok:
+                            st.session_state["edit_garden_id"] = None
+                            st.session_state.pop("garden_id", None)
+                            st.success(msg)
+                            st.rerun()
+                        else:
+                            st.error(msg)
