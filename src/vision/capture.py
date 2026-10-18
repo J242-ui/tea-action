@@ -18,6 +18,7 @@ make_demo_frame：
 from __future__ import annotations
 
 import os
+import re
 import threading
 import time
 
@@ -552,10 +553,14 @@ camera = _get_camera()
 
 
 class CameraManager:
-    """多摄像头源管理器（监控台）：默认注册 usb:0 主源，支持运行时增删。
+    """多摄像头源管理器（监控台）。
 
-    每个源是一个独立的 CameraCapture 实例，互不干扰；
-    删除源会释放其摄像头句柄，不影响其他源。
+    源配置按账号（user_id）隔离，存储在数据库 camera_sources 表：
+      - 游客 user_id=0：无配置时使用环境变量 CAMERA_SOURCE（默认 usb:0）作为默认主源
+      - 登录用户：加载自己在数据库中配置的源列表
+    采集实例按 source 全局池化：同一 source（如 usb:0）全系统只打开一个
+    CameraCapture 实例，多账号引用共享 —— 避免两个账号同时配置同一个
+    物理摄像头时并发构造/释放导致的原生崩溃或相互抢占。
     """
 
     def __init__(self):
@@ -563,28 +568,94 @@ class CameraManager:
         self._meta: dict[str, dict] = {}
         self._lock = threading.Lock()
         self._seq = 0
-        self._add_default()
+        self._user_id = 0
+        self._loaded = False
+        # 全局采集池：source -> CameraCapture（物理设备只开一个实例，多账号共享）
+        self._pool: dict[str, CameraCapture] = {}
+        # source -> 引用该采集器的 user_id 集合（池实例何时可释放）
+        self._refs: dict[str, set[int]] = {}
 
     # ---------- 内部 ----------
     def _next_id(self) -> str:
         self._seq += 1
         return f"cam{self._seq}"
 
-    def _add_default(self) -> None:
-        """默认主源：usb:0（可用 CAMERA_SOURCE 环境变量覆盖为网络源）。"""
+    def _pool_get(self, source: str, name: str = "") -> CameraCapture:
+        """从全局池取采集实例（不存在则创建）。物理设备同一 source 只开一个。"""
+        inst = self._pool.get(source)
+        if inst is None:
+            inst = CameraCapture(source=source, name=name or None)
+            self._pool[source] = inst
+        return inst
+
+    def _default_source(self) -> str:
+        src = (os.getenv("CAMERA_SOURCE", "") or "").strip()
+        return src or "usb:0"
+
+    def _load_user_sources(self, user_id: int) -> None:
+        """加载某账号的源配置到当前视图；无配置/数据库不可用时用默认主源。"""
+        from .. import db
+        try:
+            sources = db.user_cameras(user_id)
+        except Exception:  # noqa: BLE001
+            sources = []
         with self._lock:
-            src = (os.getenv("CAMERA_SOURCE", "") or "").strip() or "usb:0"
-            cam_id = self._next_id()
-            inst = CameraCapture(source=src)
-            self._cams[cam_id] = inst
-            self._meta[cam_id] = {
-                "id": cam_id, "name": inst.name, "source": src,
-                "kind": inst.kind, "enabled": True, "added_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-            }
+            self._cams.clear()
+            self._meta.clear()
+            self._seq = 0
+            if not sources:
+                # 游客/无配置：默认主源（固定 cam1，便于前端默认展示）
+                src = self._default_source()
+                cam_key = "cam1"
+                inst = self._pool_get(src, "默认摄像头")
+                self._refs.setdefault(src, set()).add(int(user_id or 0))
+                self._cams[cam_key] = inst
+                self._meta[cam_key] = {
+                    "id": cam_key, "name": inst.name, "source": src,
+                    "kind": inst.kind, "enabled": True,
+                    "added_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                }
+                self._seq = 1
+                return
+            for s in sources:
+                cam_key = s.get("cam_key") or self._next_id()
+                src = s.get("source") or ""
+                if not src.lower().startswith(("usb:", "rtsp://", "http://", "https://")):
+                    continue
+                inst = self._pool_get(src, s.get("name") or "")
+                self._refs.setdefault(src, set()).add(int(user_id or 0))
+                self._cams[cam_key] = inst
+                self._meta[cam_key] = {
+                    "id": cam_key, "name": s.get("name") or inst.name, "source": src,
+                    "kind": inst.kind, "enabled": bool(s.get("enabled", 1)),
+                    "added_at": str(s.get("created_at") or time.strftime("%Y-%m-%d %H:%M:%S")),
+                }
+                # 保证后续新加的 cam_key 不与已有冲突
+                m = re.match(r"cam(\d+)", cam_key)
+                if m:
+                    self._seq = max(self._seq, int(m.group(1)))
+
+    def set_user(self, user_id: int, force: bool = False) -> None:
+        """切换当前账号视图（游客 0 / 登录用户 id）。切换只换视图，不释放池实例。
+
+        force=True 时强制从数据库重载该账号的源配置（用于增删源后刷新视图，
+        避免内存残留默认源导致与数据库不一致）。
+        """
+        with self._lock:
+            if not force and self._loaded and self._user_id == int(user_id or 0):
+                return
+            self._user_id = int(user_id or 0)
+            self._loaded = True
+        self._load_user_sources(self._user_id)
+
+    def _ensure_loaded(self) -> None:
+        if not self._loaded:
+            self.set_user(0)
 
     # ---------- 查询 ----------
     def list(self) -> list[dict]:
-        """返回所有源的元信息 + 实时可用状态（不含画面帧，供 REST/页面列表）。"""
+        """返回当前账号所有源的元信息 + 实时可用状态（不含画面帧）。"""
+        self._ensure_loaded()
         with self._lock:
             out = []
             for cam_id, inst in self._cams.items():
@@ -597,44 +668,77 @@ class CameraManager:
             return out
 
     def get(self, cam_id: str) -> CameraCapture | None:
+        self._ensure_loaded()
         with self._lock:
             return self._cams.get(cam_id)
 
     def ids(self) -> list[str]:
+        self._ensure_loaded()
         with self._lock:
             return list(self._cams.keys())
 
     # ---------- 增删 ----------
-    def add(self, source: str, name: str = "") -> dict | None:
-        """添加一个摄像头源（usb:N / rtsp://… / http(s)://…）。校验通过返回元信息。"""
+    def add(self, source: str, name: str = "", user_id: int | None = None) -> dict | None:
+        """为某账号添加一个摄像头源（usb:N / rtsp://… / http(s)://…），同时写入数据库。
+
+        校验通过返回元信息；源实例从全局池取（同 source 只开一个物理句柄）。
+        """
         src = (source or "").strip()
         if not src:
             return None
         if not src.lower().startswith(("usb:", "rtsp://", "http://", "https://")):
             return None
+        self._ensure_loaded()
+        uid = self._user_id if user_id is None else int(user_id or 0)
         with self._lock:
-            cam_id = self._next_id()
-            inst = CameraCapture(source=src, name=name.strip() or None)
-            self._cams[cam_id] = inst
-            self._meta[cam_id] = {
-                "id": cam_id, "name": inst.name, "source": src,
-                "kind": inst.kind, "enabled": True, "added_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            cam_key = self._next_id()
+            inst = self._pool_get(src, name.strip() or None)
+            self._refs.setdefault(src, set()).add(uid)
+            self._cams[cam_key] = inst
+            self._meta[cam_key] = {
+                "id": cam_key, "name": name.strip() or inst.name, "source": src,
+                "kind": inst.kind, "enabled": True,
+                "added_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             }
-            return dict(self._meta[cam_id])
+            meta = dict(self._meta[cam_key])
+        try:
+            from .. import db
+            db.add_camera(uid, cam_key, meta["name"], src)
+        except Exception:  # noqa: BLE001 - 数据库不可用时仅内存生效
+            pass
+        return meta
 
-    def remove(self, cam_id: str) -> bool:
-        """删除一个源并释放其摄像头句柄。默认主源也允许删除（演示将无实拍）。"""
+    def remove(self, cam_id: str, user_id: int | None = None) -> bool:
+        """删除某账号的一个源：从当前视图移除，并从数据库删除；
+        池中无其他账号引用时释放物理句柄。"""
+        self._ensure_loaded()
+        uid = self._user_id if user_id is None else int(user_id or 0)
         with self._lock:
             inst = self._cams.pop(cam_id, None)
             self._meta.pop(cam_id, None)
-        if inst is not None:
+            if inst is None:
+                return False
+            src = inst.source
+            refs = self._refs.get(src, set())
+            refs.discard(uid)
+            pool_gone = False
+            if not refs:
+                self._refs.pop(src, None)
+                if self._pool.pop(src, None) is not None:
+                    pool_gone = True
+        try:
+            from .. import db
+            db.remove_camera(uid, cam_id)
+        except Exception:  # noqa: BLE001
+            pass
+        if pool_gone:
             inst.release()
-            return True
-        return False
+        return True
 
     # ---------- 采集 ----------
     def read_all(self) -> list[dict]:
-        """依次读取所有启用源的一帧（由 runner 调用，返回帧 + 来源标记）。"""
+        """依次读取当前账号所有启用源的一帧（由 runner 调用，返回帧 + 来源标记）。"""
+        self._ensure_loaded()
         out = []
         for cam_id, inst in list(self._cams.items()):
             meta = self._meta.get(cam_id, {})

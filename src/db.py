@@ -506,6 +506,7 @@ CREATE TABLE IF NOT EXISTS agent_decision_log (
 
 CREATE TABLE IF NOT EXISTS camera_alert_log (
     id           BIGINT AUTO_INCREMENT PRIMARY KEY,
+    user_id      INT          NOT NULL DEFAULT 0,
     garden_key   VARCHAR(64)  NOT NULL,
     alert_date   VARCHAR(16)  NOT NULL,
     title        VARCHAR(255) DEFAULT NULL,
@@ -514,7 +515,19 @@ CREATE TABLE IF NOT EXISTS camera_alert_log (
     actions_text TEXT,
     image_base64 MEDIUMTEXT,
     created_at   DATETIME     DEFAULT CURRENT_TIMESTAMP,
-    KEY idx_alert (garden_key, alert_date)
+    KEY idx_alert (garden_key, alert_date),
+    KEY idx_alert_user (user_id, created_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS camera_sources (
+    id         INT AUTO_INCREMENT PRIMARY KEY,
+    user_id    INT          NOT NULL DEFAULT 0,
+    cam_key    VARCHAR(32)  NOT NULL,
+    name       VARCHAR(64)  DEFAULT NULL,
+    source     VARCHAR(255) NOT NULL,
+    enabled    TINYINT      DEFAULT 1,
+    created_at DATETIME     DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE KEY uq_user_cam (user_id, cam_key)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 """
     conn = connect()
@@ -529,6 +542,42 @@ CREATE TABLE IF NOT EXISTS camera_alert_log (
         conn.close()
 
 
+def _ensure_column(conn, table: str, column: str, ddl: str) -> None:
+    """幂等补列：列不存在则 ALTER TABLE ADD（兼容旧库升级）。"""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT COUNT(*) AS n FROM information_schema.columns "
+            "WHERE table_schema=DATABASE() AND table_name=%s AND column_name=%s",
+            (table, column),
+        )
+        if int(cur.fetchone()["n"]) == 0:
+            cur.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+
+
+def _migrate_agent_user_id() -> None:
+    """为 Agent 历史表补齐 user_id 列（0 = 游客/历史数据），实现按账号隔离历史。"""
+    # 注意：此处只写类型定义，列名由 _ensure_column 统一拼接（避免 ADD COLUMN user_id user_id … 语法错误）
+    cols = {
+        "sensor_log": "INT NOT NULL DEFAULT 0",
+        "actuator_log": "INT NOT NULL DEFAULT 0",
+        "agent_decision_log": "INT NOT NULL DEFAULT 0",
+        "camera_alert_log": "INT NOT NULL DEFAULT 0",
+    }
+    try:
+        conn = connect()
+        try:
+            for table, ddl in cols.items():
+                try:
+                    _ensure_column(conn, table, "user_id", ddl)
+                except Exception:  # noqa: BLE001 - 单表迁移失败不影响其余
+                    pass
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception:  # noqa: BLE001 - 数据库不可用时静默
+        pass
+
+
 def init_db_ext(strict: bool = False) -> None:
     """确保扩展表存在。
 
@@ -537,9 +586,122 @@ def init_db_ext(strict: bool = False) -> None:
     """
     try:
         _extend_schema()
+        _migrate_agent_user_id()
+        ensure_admin()
     except Exception:  # noqa: BLE001 - 数据库不可用时静默，游客演示不受影响
         if strict:
             raise
+
+
+# ----------------------------------------------------------------
+# 示例账号
+# ----------------------------------------------------------------
+DEMO_ADMIN_USER = "admin"
+DEMO_ADMIN_PASSWORD = "123456"   # 测试账号统一密码
+
+
+def ensure_admin() -> None:
+    """初始化示例账号 admin/123456（已存在则同步为测试密码，保证约定一致）。"""
+    try:
+        conn = connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT id, salt FROM users WHERE username=%s", (DEMO_ADMIN_USER,))
+                row = cur.fetchone()
+                if row is None:
+                    salt = secrets.token_hex(16)
+                    cur.execute(
+                        "INSERT INTO users (username, password_hash, salt, nickname) VALUES (%s,%s,%s,%s)",
+                        (DEMO_ADMIN_USER, _hash_password(DEMO_ADMIN_PASSWORD, salt), salt, "管理员"),
+                    )
+                else:
+                    salt = secrets.token_hex(16)
+                    cur.execute(
+                        "UPDATE users SET password_hash=%s, salt=%s WHERE id=%s",
+                        (_hash_password(DEMO_ADMIN_PASSWORD, salt), salt, row["id"]),
+                    )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception:  # noqa: BLE001 - 数据库不可用时静默
+        pass
+
+
+def get_user_by_id(user_id: int) -> dict | None:
+    """按 id 查用户（用于前端展示当前账号）。游客 0 返回 None。"""
+    if not user_id:
+        return None
+    try:
+        conn = connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT id, username, nickname, created_at FROM users WHERE id=%s", (user_id,))
+                row = cur.fetchone()
+                return dict(row) if row else None
+        finally:
+            conn.close()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+# ----------------------------------------------------------------
+# 摄像头源（按账号绑定）
+# ----------------------------------------------------------------
+def user_cameras(user_id: int) -> list[dict]:
+    """返回某账号（游客 0）配置的摄像头源列表（按添加顺序）。"""
+    try:
+        conn = connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT cam_key,name,source,enabled,created_at FROM camera_sources "
+                    "WHERE user_id=%s ORDER BY id",
+                    (int(user_id or 0),),
+                )
+                return [dict(r) for r in cur.fetchall()]
+        finally:
+            conn.close()
+    except Exception:  # noqa: BLE001 - 数据库不可用时回退默认源
+        return []
+
+
+def add_camera(user_id: int, cam_key: str, name: str, source: str) -> bool:
+    """为某账号新增一个摄像头源（按 (user_id, cam_key) 幂等）。"""
+    try:
+        conn = connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO camera_sources (user_id,cam_key,name,source) VALUES (%s,%s,%s,%s) "
+                    "ON DUPLICATE KEY UPDATE name=VALUES(name), source=VALUES(source)",
+                    (int(user_id or 0), cam_key, name or None, source),
+                )
+            conn.commit()
+            return True
+        finally:
+            conn.close()
+    except Exception as e:  # noqa: BLE001
+        print(f"[db] add_camera 失败: {e}")
+        return False
+
+
+def remove_camera(user_id: int, cam_key: str) -> bool:
+    """删除某账号的一个摄像头源（只能删自己的）。"""
+    try:
+        conn = connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM camera_sources WHERE user_id=%s AND cam_key=%s",
+                    (int(user_id or 0), cam_key),
+                )
+                removed = cur.rowcount > 0
+            conn.commit()
+            return removed
+        finally:
+            conn.close()
+    except Exception:  # noqa: BLE001
+        return False
 
 
 # ----------------------------------------------------------------
@@ -715,15 +877,15 @@ def eval_log_history(limit: int = 50) -> list[dict]:
 # ===========================================================================
 
 def log_sensor(garden_key: str, sensor_type: str, value: float,
-               unit: str = "%", meta: dict | None = None) -> None:
+               unit: str = "%", meta: dict | None = None, user_id: int = 0) -> None:
     try:
         conn = connect()
         try:
             with conn.cursor() as cur:
                 cur.execute(
-                    "INSERT INTO sensor_log (garden_key,sensor_type,value,unit,meta_json) "
-                    "VALUES (%s,%s,%s,%s,%s)",
-                    (garden_key, sensor_type, float(value), unit,
+                    "INSERT INTO sensor_log (user_id,garden_key,sensor_type,value,unit,meta_json) "
+                    "VALUES (%s,%s,%s,%s,%s,%s)",
+                    (int(user_id or 0), garden_key, sensor_type, float(value), unit,
                      json.dumps(meta, ensure_ascii=False, default=str) if meta else None),
                 )
             conn.commit()
@@ -734,17 +896,17 @@ def log_sensor(garden_key: str, sensor_type: str, value: float,
 
 
 def recent_sensor(garden_key: str, sensor_type: str = "soil_moisture",
-                  limit: int = 50) -> list[dict]:
-    """返回某茶园某传感器最近的读数（时间升序）。"""
+                  limit: int = 50, user_id: int = 0) -> list[dict]:
+    """返回某账号某茶园某传感器最近的读数（时间升序）。"""
     try:
         conn = connect()
         try:
             with conn.cursor() as cur:
                 cur.execute(
                     "SELECT value,unit,created_at FROM sensor_log "
-                    "WHERE garden_key=%s AND sensor_type=%s "
+                    "WHERE user_id=%s AND garden_key=%s AND sensor_type=%s "
                     "ORDER BY id DESC LIMIT %s",
-                    (garden_key, sensor_type, limit),
+                    (int(user_id or 0), garden_key, sensor_type, limit),
                 )
                 rows = [dict(r) for r in cur.fetchall()]
             rows.reverse()
@@ -757,16 +919,16 @@ def recent_sensor(garden_key: str, sensor_type: str = "soil_moisture",
 
 def log_camera_alert(garden_key: str, alert_date: str, title: str, content: str,
                      level: str = "low", actions_text: str = "",
-                     image_b64: str = "") -> None:
+                     image_b64: str = "", user_id: int = 0) -> None:
     """写入一条摄像头监测预警（每日推送）。数据库不可用时降级跳过。"""
     try:
         conn = connect()
         try:
             with conn.cursor() as cur:
                 cur.execute(
-                    "INSERT INTO camera_alert_log (garden_key,alert_date,title,content,level,"
-                    "actions_text,image_base64) VALUES (%s,%s,%s,%s,%s,%s,%s)",
-                    (garden_key, alert_date, title, content, level, actions_text, image_b64),
+                    "INSERT INTO camera_alert_log (user_id,garden_key,alert_date,title,content,level,"
+                    "actions_text,image_base64) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
+                    (int(user_id or 0), garden_key, alert_date, title, content, level, actions_text, image_b64),
                 )
             conn.commit()
         finally:
@@ -775,17 +937,17 @@ def log_camera_alert(garden_key: str, alert_date: str, title: str, content: str,
         print(f"[db] log_camera_alert 失败: {e}")
 
 
-def latest_camera_alert(garden_key: str) -> dict | None:
-    """返回最近一条摄像头监测预警（含画面）。无记录返回 None。"""
+def latest_camera_alert(garden_key: str, user_id: int = 0) -> dict | None:
+    """返回某账号最近一条摄像头监测预警（含画面）。无记录返回 None。"""
     try:
         conn = connect()
         try:
             with conn.cursor() as cur:
                 cur.execute(
                     "SELECT id,alert_date,title,content,level,actions_text,image_base64,created_at "
-                    "FROM camera_alert_log WHERE garden_key=%s "
+                    "FROM camera_alert_log WHERE user_id=%s AND garden_key=%s "
                     "ORDER BY id DESC LIMIT 1",
-                    (garden_key,),
+                    (int(user_id or 0), garden_key),
                 )
                 row = cur.fetchone()
                 return dict(row) if row else None
@@ -796,17 +958,17 @@ def latest_camera_alert(garden_key: str) -> dict | None:
         return None
 
 
-def camera_alert_history(garden_key: str, limit: int = 30) -> list[dict]:
-    """返回摄像头监测预警历史（不含大图 base64，避免响应过大）。"""
+def camera_alert_history(garden_key: str, limit: int = 30, user_id: int = 0) -> list[dict]:
+    """返回某账号摄像头监测预警历史（不含大图 base64，避免响应过大）。"""
     try:
         conn = connect()
         try:
             with conn.cursor() as cur:
                 cur.execute(
                     "SELECT id,alert_date,title,content,level,actions_text,created_at "
-                    "FROM camera_alert_log WHERE garden_key=%s "
+                    "FROM camera_alert_log WHERE user_id=%s AND garden_key=%s "
                     "ORDER BY id DESC LIMIT %s",
-                    (garden_key, limit),
+                    (int(user_id or 0), garden_key, limit),
                 )
                 return [dict(r) for r in cur.fetchall()]
         finally:
@@ -818,15 +980,15 @@ def camera_alert_history(garden_key: str, limit: int = 30) -> list[dict]:
 
 def log_actuator(garden_key: str, device: str, operation: str,
                  duration_min: float | None = None, reason: str | None = None,
-                 state: dict | None = None) -> None:
+                 state: dict | None = None, user_id: int = 0) -> None:
     try:
         conn = connect()
         try:
             with conn.cursor() as cur:
                 cur.execute(
-                    "INSERT INTO actuator_log (garden_key,device,operation,duration_min,reason,state_json) "
-                    "VALUES (%s,%s,%s,%s,%s,%s)",
-                    (garden_key, device, operation, duration_min, reason,
+                    "INSERT INTO actuator_log (user_id,garden_key,device,operation,duration_min,reason,state_json) "
+                    "VALUES (%s,%s,%s,%s,%s,%s,%s)",
+                    (int(user_id or 0), garden_key, device, operation, duration_min, reason,
                      json.dumps(state, ensure_ascii=False, default=str) if state else None),
                 )
             conn.commit()
@@ -836,7 +998,8 @@ def log_actuator(garden_key: str, device: str, operation: str,
         print(f"[db] log_actuator 失败: {e}")
 
 
-def actuator_history(garden_key: str, device: str | None = None, limit: int = 50) -> list[dict]:
+def actuator_history(garden_key: str, device: str | None = None, limit: int = 50,
+                     user_id: int = 0) -> list[dict]:
     try:
         conn = connect()
         try:
@@ -844,14 +1007,14 @@ def actuator_history(garden_key: str, device: str | None = None, limit: int = 50
                 if device:
                     cur.execute(
                         "SELECT device,operation,duration_min,reason,created_at FROM actuator_log "
-                        "WHERE garden_key=%s AND device=%s ORDER BY id DESC LIMIT %s",
-                        (garden_key, device, limit),
+                        "WHERE user_id=%s AND garden_key=%s AND device=%s ORDER BY id DESC LIMIT %s",
+                        (int(user_id or 0), garden_key, device, limit),
                     )
                 else:
                     cur.execute(
                         "SELECT device,operation,duration_min,reason,created_at FROM actuator_log "
-                        "WHERE garden_key=%s ORDER BY id DESC LIMIT %s",
-                        (garden_key, limit),
+                        "WHERE user_id=%s AND garden_key=%s ORDER BY id DESC LIMIT %s",
+                        (int(user_id or 0), garden_key, limit),
                     )
                 return [dict(r) for r in cur.fetchall()]
         finally:
@@ -862,16 +1025,16 @@ def actuator_history(garden_key: str, device: str | None = None, limit: int = 50
 
 def log_agent_decision(garden_key: str, decision_type: str, summary: str | None,
                        inputs: dict | None = None, actions: list | None = None,
-                       overall_level: str = "low") -> None:
+                       overall_level: str = "low", user_id: int = 0) -> None:
     try:
         conn = connect()
         try:
             with conn.cursor() as cur:
                 cur.execute(
                     "INSERT INTO agent_decision_log "
-                    "(garden_key,decision_type,summary,inputs_json,actions_json,overall_level) "
-                    "VALUES (%s,%s,%s,%s,%s,%s)",
-                    (garden_key, decision_type, summary,
+                    "(user_id,garden_key,decision_type,summary,inputs_json,actions_json,overall_level) "
+                    "VALUES (%s,%s,%s,%s,%s,%s,%s)",
+                    (int(user_id or 0), garden_key, decision_type, summary,
                      json.dumps(inputs, ensure_ascii=False, default=str) if inputs else None,
                      json.dumps(actions, ensure_ascii=False, default=str) if actions else None,
                      overall_level),
@@ -883,16 +1046,16 @@ def log_agent_decision(garden_key: str, decision_type: str, summary: str | None,
         print(f"[db] log_agent_decision 失败: {e}")
 
 
-def agent_decision_history(garden_key: str, limit: int = 30) -> list[dict]:
-    """按时间倒序返回 Agent 决策记录，inputs/actions 已解析为 dict。"""
+def agent_decision_history(garden_key: str, limit: int = 30, user_id: int = 0) -> list[dict]:
+    """按时间倒序返回某账号 Agent 决策记录，inputs/actions 已解析为 dict。"""
     try:
         conn = connect()
         try:
             with conn.cursor() as cur:
                 cur.execute(
                     "SELECT decision_type,summary,inputs_json,actions_json,overall_level,created_at "
-                    "FROM agent_decision_log WHERE garden_key=%s ORDER BY id DESC LIMIT %s",
-                    (garden_key, limit),
+                    "FROM agent_decision_log WHERE user_id=%s AND garden_key=%s ORDER BY id DESC LIMIT %s",
+                    (int(user_id or 0), garden_key, limit),
                 )
                 rows = [dict(r) for r in cur.fetchall()]
             for r in rows:

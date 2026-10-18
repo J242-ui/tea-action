@@ -46,7 +46,16 @@ def ws_alive() -> bool:
         return False
 
 
-def _api(path: str, method: str = "GET", timeout: int = 5, data: dict | None = None):
+def current_uid() -> int:
+    """当前登录账号 id（游客 0）。摄像头源与历史数据均按该账号绑定。"""
+    user = st.session_state.get("user")
+    if user and user.get("id"):
+        return int(user["id"])
+    return 0
+
+
+def _api(path: str, method: str = "GET", timeout: int = 5, data: dict | None = None,
+         params: dict | None = None):
     """请求 WS 服务。默认 5 秒超时：8510 异常时页面快速降级提示，不干等。
 
     整轮决策（/api/agent/step）可能包含首帧预热等耗时操作，调用方单独传较长超时。
@@ -56,7 +65,7 @@ def _api(path: str, method: str = "GET", timeout: int = 5, data: dict | None = N
             if data is not None:
                 return requests.post(f"{WS_BASE}{path}", json=data, timeout=timeout).json()
             return requests.post(f"{WS_BASE}{path}", timeout=timeout).json()
-        return requests.get(f"{WS_BASE}{path}", timeout=timeout).json()
+        return requests.get(f"{WS_BASE}{path}", params=params, timeout=timeout).json()
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "message": str(e)}
 
@@ -122,6 +131,10 @@ def main() -> None:
 
     garden = ui.select_garden()
     alive = ws_alive()
+    uid = current_uid()
+    user = st.session_state.get("user")
+    who = f"账号：{user.get('nickname') or user.get('username')}（#{uid}）" if user else "游客（演示数据）"
+    st.caption(f"当前身份：{who} ｜ 摄像头源与历史数据均按此账号隔离")
 
     # ---------- 顶部控制区 ----------
     c1, c2, c3 = st.columns([2, 2, 2])
@@ -132,30 +145,34 @@ def main() -> None:
                 st.rerun()
     with c2:
         if alive and st.button("▶️ 启动 Agent 主循环", type="primary", width="stretch"):
-            r = _api("/api/agent/start", "POST")
+            r = _api("/api/agent/start", "POST",
+                     data={"user_id": uid, "garden_key": garden.get("key")})
             st.toast("Agent 已启动" if r.get("ok") else f"启动失败：{r.get('message')}")
+            if r.get("ok"):
+                st.rerun()
     with c3:
         if alive and st.button("⏹ 停止 Agent", width="stretch"):
-            r = _api("/api/agent/stop", "POST")
+            r = _api("/api/agent/stop", "POST", data={"user_id": uid})
             st.toast("Agent 已停止" if r.get("ok") else f"停止失败：{r.get('message')}")
         if alive and st.button("⚡ 立即执行一步", width="stretch"):
-            _api("/api/agent/step", "POST", timeout=30)
+            _api("/api/agent/step", "POST", timeout=30, data={"user_id": uid})
             st.rerun()
 
     if not alive:
         st.warning("动态展示服务（WS）未运行。点击上方「一键启动 WS 服务」，再打开下方动态网页即可看到完整链路。")
         st.divider()
-        _render_history(garden)
+        _render_history(garden, uid)
         return
 
     status = _api("/api/status")
     snap = status.get("latest") or {}
 
-    # ---------- 摄像头源管理（监控台） ----------
+    # ---------- 摄像头源管理（按账号） ----------
     st.divider()
     st.markdown("### 📹 摄像头源管理")
-    st.caption("默认已注册 USB 摄像头 (usb:0)。可添加网络摄像头（RTSP/HTTP），多路画面在动态监控台网页实时显示。")
-    cams = _api("/api/cameras").get("cameras", [])
+    st.caption("摄像头源与当前账号绑定（游客为系统默认源）。登录后可添加网络摄像头（RTSP/HTTP），"
+               "多路画面在动态监控台网页实时显示；历史数据同样按账号隔离。")
+    cams = _api("/api/cameras", params={"user_id": uid}).get("cameras", [])
     if cams:
         rows = [{
             "ID": c.get("id"),
@@ -178,7 +195,8 @@ def main() -> None:
         st.markdown("")
         if st.button("➕ 添加摄像头源", type="primary"):
             if src_input.strip():
-                r = _api("/api/cameras/add", "POST", timeout=10, data={"source": src_input.strip()})
+                r = _api("/api/cameras/add", "POST", timeout=10,
+                         data={"user_id": uid, "source": src_input.strip()})
                 st.toast("已添加" if r.get("ok") else f"添加失败：{r.get('message')}")
                 if r.get("ok"):
                     st.rerun()
@@ -192,7 +210,8 @@ def main() -> None:
             st.markdown("")
             st.markdown("")
             if st.button("🗑 删除摄像头源"):
-                r = _api("/api/cameras/remove", "POST", timeout=10, data={"cam_id": del_id})
+                r = _api("/api/cameras/remove", "POST", timeout=10,
+                         data={"user_id": uid, "cam_id": del_id})
                 st.toast("已删除" if r.get("ok") else f"删除失败：{r.get('message')}")
                 if r.get("ok"):
                     st.rerun()
@@ -218,7 +237,8 @@ def main() -> None:
         st.markdown("")
         if st.button("✅ 应用刷新设置", type="primary"):
             cfg = _api("/api/agent/config", "POST",
-                       data={"refresh_mode": "stream" if mode == "持续录像" else "interval",
+                       data={"user_id": uid,
+                             "refresh_mode": "stream" if mode == "持续录像" else "interval",
                              "interval": float(interval)})
             st.toast("刷新设置已应用" if cfg.get("ok") else f"应用失败：{cfg.get('message')}")
             if cfg.get("ok"):
@@ -268,7 +288,7 @@ def main() -> None:
                     unsafe_allow_html=True,
                 )
 
-        hist = _api("/api/history")
+        hist = _api("/api/history", params={"user_id": uid})
         if hist.get("items"):
             st.divider()
             st.subheader("📜 Agent 决策历史")
@@ -313,10 +333,11 @@ def main() -> None:
 
         st.divider()
         st.markdown("### 🖥 动态动画网页")
-        st.markdown(f"打开 [茶园智能执行动态展示]({WS_BASE}/) （WebSocket 实时推送执行器动画）")
+        dash_url = f"{WS_BASE}/?user_id={uid}"
+        st.markdown(f"打开 [茶园智能执行动态展示]({dash_url}) （WebSocket 实时推送执行器动画，按当前账号显示摄像头源）")
         if st.button("🔗 在浏览器打开动态网页", width="stretch"):
             import webbrowser
-            webbrowser.open(f"{WS_BASE}/")
+            webbrowser.open(dash_url)
 
         # Agent 状态
         st.divider()
@@ -326,9 +347,9 @@ def main() -> None:
                    f"已执行 {status.get('steps', 0)} 轮 ｜ 刷新：{_mode_label}")
 
 
-def _render_history(garden: dict) -> None:
-    """WS 服务不可用时，直接读库展示历史决策。"""
-    rows = db.agent_decision_history(garden["key"], limit=10)
+def _render_history(garden: dict, uid: int = 0) -> None:
+    """WS 服务不可用时，直接读库展示当前账号的历史决策。"""
+    rows = db.agent_decision_history(garden["key"], limit=10, user_id=uid)
     if rows:
         st.subheader("📜 Agent 决策历史（数据库）")
         df = pd.DataFrame([{

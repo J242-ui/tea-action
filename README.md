@@ -293,6 +293,19 @@ REST API：`GET /api/status`、`GET /api/frame`（最近一帧画面）、`GET /
 - **数据**：Agent 每轮决策自动写入 `daily_recorder`（当日累计），到点由 `daily_alert` 汇总推送并归档
 - **双端展示**：监控台（8510）与风险预警页（8501）均实时渲染
 
+### 🔐 账号绑定与数据隔离
+
+摄像头源与整个项目的历史数据均按账号隔离：
+
+- **摄像头源按账号绑定**：登录用户在数据库 `camera_sources` 表维护自己的源列表（USB/RTSP/HTTP），监控台与智能执行页按 `user_id` 展示；游客（`user_id=0`）无配置时使用环境变量 `CAMERA_SOURCE` 默认源
+- **历史数据按账号隔离**：`sensor_log` / `actuator_log` / `agent_decision_log` / `camera_alert_log` 均带 `user_id` 列，旧数据归游客；Agent 决策、传感器、执行器、每日预警的落库与查询全部按当前账号过滤
+- **Agent 归属账号**：启动 Agent 时指定 `user_id`（REST `POST /api/agent/start` body 或 8501 控制台自动携带），Agent 运行上下文（茶园、落库、预警）跟随该账号；运行中不可切换账号
+- **示例账号**：`admin / 123456`（所有测试账号统一密码 `123456`），系统启动时自动创建/同步
+- **游客模式保留**：未登录时全部功能可用，数据归属游客（`user_id=0`）
+- **监控台指定账号**：`http://127.0.0.1:8510/?user_id=2`（URL 参数指定账号，默认游客 0）
+- **手动建库、系统自动建表**：只需手动执行 `CREATE DATABASE tea_garden`；`camera_sources` 表与各历史表 `user_id` 列由系统启动时自动创建/迁移，无需手动操作
+- **物理设备池化**：同一 source（如 `usb:0`）全系统只打开一个采集实例，多账号引用共享，切换账号不抢占、不重复开设备
+
 ### 性能与稳定性设计
 
 针对「越用越卡、Agent 启动不了/停不掉」的根因做了专项优化：

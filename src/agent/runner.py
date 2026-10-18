@@ -29,8 +29,11 @@ class AgentRunner:
     """智能执行 Agent 主循环。"""
 
     def __init__(self, garden_key: str = DEFAULT_GARDEN_KEY, interval: float = 5.0,
-                 refresh_mode: str = "interval"):
+                 refresh_mode: str = "interval", user_id: int = 0):
         self.garden_key = garden_key
+        # user_id：当前 Agent 上下文归属的账号（0 = 游客，>0 = 登录用户）。
+        # 传感器/执行器/决策/预警等历史数据按该账号落库与查询。
+        self.user_id = int(user_id or 0)
         # refresh_mode: "interval" 自定义间隔整轮决策；"stream" 持续录像（画面连续推送，决策按间隔节流）
         self.refresh_mode = "stream" if str(refresh_mode).strip().lower() == "stream" else "interval"
         self.interval = max(0.5, float(interval))
@@ -59,6 +62,44 @@ class AgentRunner:
                 fn(event)
             except Exception:  # noqa: BLE001
                 pass
+
+    # ---------- 上下文（账号绑定） ----------
+    def set_context(self, user_id: int = 0, garden_key: str | None = None) -> dict:
+        """设置 Agent 归属账号与茶园（只能在未运行时切换）。
+
+        user_id=0 表示游客（内置演示茶园）；登录用户使用自己的茶园 key。
+        返回当前上下文信息。
+        """
+        with self._lock:
+            if self.running:
+                return {"ok": False, "message": "Agent 正在运行，请先停止后再切换账号", **self.context()}
+            uid = int(user_id or 0)
+            if uid and uid != self.user_id:
+                # 登录账号：取该用户第一个茶园作为 Agent 服务茶园（无则保持默认演示茶园）
+                try:
+                    gardens = db.user_gardens(uid)
+                    if gardens:
+                        self.garden_key = gardens[0]["id"] if "id" in gardens[0] else self.garden_key
+                        g = config.get_garden(self.garden_key)
+                        if g is None and "key" in gardens[0]:
+                            self.garden_key = gardens[0]["key"]
+                except Exception:  # noqa: BLE001
+                    pass
+            if garden_key:
+                self.garden_key = garden_key
+            self.user_id = uid
+        return {"ok": True, **self.context()}
+
+    def context(self) -> dict:
+        """当前 Agent 上下文：归属账号、茶园、运行状态。"""
+        return {
+            "user_id": self.user_id,
+            "garden_key": self.garden_key,
+            "running": self.running,
+            "steps": self.steps,
+            "interval": self.interval,
+            "refresh_mode": self.refresh_mode,
+        }
 
     # ---------- 配置 ----------
     def configure(self, refresh_mode: str | None = None, interval: float | None = None) -> dict:
@@ -277,7 +318,8 @@ class AgentRunner:
         # 1) 传感器
         soil = sensor.read()
         try:
-            db.log_sensor(self.garden_key, soil["type"], soil["value"], soil["unit"], soil.get("meta"))
+            db.log_sensor(self.garden_key, soil["type"], soil["value"], soil["unit"],
+                          soil.get("meta"), user_id=self.user_id)
         except Exception:  # noqa: BLE001 - 数据库不可用时降级跳过
             pass
 
@@ -288,7 +330,8 @@ class AgentRunner:
         # 2.1) 土壤湿度历史（监控台趋势图数据，最近 60 条）
         soil_history = []
         try:
-            soil_history = db.recent_sensor(self.garden_key, "soil_moisture", limit=60)
+            soil_history = db.recent_sensor(self.garden_key, "soil_moisture", limit=60,
+                                            user_id=self.user_id)
         except Exception:  # noqa: BLE001
             pass
 
@@ -322,12 +365,14 @@ class AgentRunner:
         # 6) 落库（数据库不可用时降级跳过，不影响决策链路）
         try:
             for a in decision["actions"]:
-                db.log_actuator(self.garden_key, a["device"], a["op"], a.get("duration_min"), a.get("reason"))
+                db.log_actuator(self.garden_key, a["device"], a["op"], a.get("duration_min"),
+                                a.get("reason"), user_id=self.user_id)
             db.log_agent_decision(self.garden_key, decision["decision_type"], decision["summary"],
                                   inputs={"soil": soil, "detections": det_result["summary"],
                                           "weather": self._weather_light(weather)},
                                   actions=decision["actions"],
-                                  overall_level=decision["overall_level"])
+                                  overall_level=decision["overall_level"],
+                                  user_id=self.user_id)
         except Exception:  # noqa: BLE001 - 落库失败不影响本轮执行与推送
             pass
 
@@ -352,6 +397,7 @@ class AgentRunner:
         # 8) 状态快照 + 广播
         snapshot = {
             "ts": _ts(),
+            "user_id": self.user_id,
             "garden": {"key": self.garden_key, "name": garden.get("name", self.garden_key)},
             "camera": {"available": bool(cams) and cams[0]["available"],
                        "backend": det_result.get("backend", "sim"),

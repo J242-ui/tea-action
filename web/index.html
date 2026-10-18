@@ -335,6 +335,8 @@
 <footer>茶园智能执行演示 · 多路摄像头监控台 · WebSocket 实时推送 · 摄像头不可用时自动降级演示帧</footer>
 
 <script>
+// 当前账号（URL ?user_id=，游客默认 0）：摄像头源与历史数据按账号绑定
+const UID = (new URLSearchParams(location.search).get("user_id") || "0").trim() || "0";
 const DECISION_CN = {
   irrigate: "💧 自动浇水", irrigating: "💧 灌溉中", spray: "🚿 自动打药", cool: "❄️ 降温喷灌",
   stop: "⏹ 停止作业", noop: "✔ 无操作（观察中）"
@@ -592,10 +594,10 @@ function renderFrame(s) {
   if (s.steps !== undefined) $("steps").textContent = s.steps || 0;
 }
 
-// ================= 摄像头管理（REST）=================
+// ================= 摄像头管理（REST，按账号）=================
 async function loadCams() {
   try {
-    const r = await fetch("/api/cameras", { cache: "no-store" });
+    const r = await fetch("/api/cameras?user_id=" + UID, { cache: "no-store" });
     if (!r.ok) return;
     const j = await r.json();
     if (j.ok) renderCams(j.cameras.map(c => ({
@@ -617,7 +619,7 @@ async function addCam() {
     const r = await fetch("/api/cameras/add", {
       method: "POST", cache: "no-store",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ source, name }),
+      body: JSON.stringify({ user_id: UID, source, name }),
     });
     const j = await r.json();
     if (j.ok) {
@@ -636,7 +638,7 @@ async function removeCam(camId) {
     const r = await fetch("/api/cameras/remove", {
       method: "POST", cache: "no-store",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ cam_id: camId }),
+      body: JSON.stringify({ user_id: UID, cam_id: camId }),
     });
     const j = await r.json();
     if (j.ok) removeCamCard(camId);
@@ -672,7 +674,7 @@ function renderAlert(alert) {
 
 async function loadLatestAlert() {
   try {
-    const r = await fetch("/api/alerts/latest", { cache: "no-store" });
+    const r = await fetch("/api/alerts/latest?user_id=" + UID, { cache: "no-store" });
     if (!r.ok) return;
     const j = await r.json();
     if (!j.ok) return;

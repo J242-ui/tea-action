@@ -18,6 +18,7 @@ from datetime import datetime
 
 from .. import db
 from .daily_recorder import daily_recorder
+from .runner import runner  # 复用 Agent 当前归属账号（user_id），预警按账号落库
 
 DEFAULT_ALERT_TIME = "09:00"
 
@@ -107,6 +108,7 @@ def build_alert(garden_key: str) -> dict | None:
         "kind": "alert_push",
         "data": {
             "garden_key": garden_key,
+            "user_id": runner.user_id,
             "alert_date": date_str,
             "title": title,
             "content": content,
@@ -173,11 +175,12 @@ class DailyAlertScheduler:
         self._last_date = date_str
         self._latest = alert
         d = alert["data"]
-        # 落库（数据库不可用时降级跳过，广播仍发送）
+        # 落库（数据库不可用时降级跳过，广播仍发送）；按 Agent 当前归属账号落库
         try:
             db.log_camera_alert(
                 self.garden_key, d["alert_date"], d["title"], d["content"],
                 d["level"], d["actions_text"], d.get("image_b64", ""),
+                user_id=runner.user_id,
             )
         except Exception:  # noqa: BLE001
             pass

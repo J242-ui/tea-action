@@ -30,9 +30,13 @@ overall = engine.assess_all(now, daily)
 ui.overall_risk_banner(overall)
 
 # ===== 📹 摄像头监测预警（每日推送一次：拍摄画面 + 病虫害情况 + 处理情况）=====
+_user_alert = current_user()
+_alert_uid = int(_user_alert["id"]) if _user_alert else 0
 with st.expander("📹 摄像头监测预警（每日推送）", expanded=True):
-    st.caption("基于多路摄像头实时监测：每天推送一次茶园视频监测日报（拍摄画面 + 病虫害检出 + Agent 处理情况）。")
-    latest_alert = db.latest_camera_alert(garden.get("key", garden.get("name", "")))
+    st.caption("基于多路摄像头实时监测：每天推送一次茶园视频监测日报（拍摄画面 + 病虫害检出 + Agent 处理情况），"
+               "历史数据按当前账号隔离展示。")
+    latest_alert = db.latest_camera_alert(garden.get("key", garden.get("name", "")),
+                                          user_id=_alert_uid)
     if latest_alert:
         _a = latest_alert
         _ac = ui.LEVEL_COLOR.get(_a.get("level", "low"), "#888")
@@ -58,7 +62,8 @@ with st.expander("📹 摄像头监测预警（每日推送）", expanded=True):
     else:
         st.info("暂无摄像头监测预警：Agent 运行后每天固定时间自动推送一次（默认 09:00，可用 ALERT_DAILY_TIME 配置）。")
 
-    _hist = db.camera_alert_history(garden.get("key", garden.get("name", "")), limit=15)
+    _hist = db.camera_alert_history(garden.get("key", garden.get("name", "")), limit=15,
+                                    user_id=_alert_uid)
     if _hist:
         with st.expander(f"📋 摄像头监测预警历史（最近 {len(_hist)} 条）", expanded=False):
             for _r in _hist:

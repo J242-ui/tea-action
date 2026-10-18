@@ -39,6 +39,27 @@ def _json_body(data: dict, status: int = 200) -> bytes:
     return json.dumps(data, ensure_ascii=False, default=str).encode("utf-8")
 
 
+def _query_params(scope) -> dict:
+    """解析 URL 查询参数（GET 请求的 user_id 等）。"""
+    qs = (scope.get("query_string") or b"").decode("utf-8")
+    out: dict = {}
+    for kv in qs.split("&"):
+        if not kv:
+            continue
+        k, _, v = kv.partition("=")
+        if k:
+            out[k] = v
+    return out
+
+
+def _uid(v) -> int:
+    """把 user_id 参数安全转 int（游客默认 0）。"""
+    try:
+        return int(str(v or "").strip() or 0)
+    except Exception:  # noqa: BLE001
+        return 0
+
+
 class TeaAgentASGI:
     """手写 ASGI 应用：HTTP REST + WebSocket 推送，无框架依赖。"""
 
@@ -171,34 +192,62 @@ class TeaAgentASGI:
                     "interval": runner.interval,
                     "refresh_mode": runner.refresh_mode,
                     "garden_key": runner.garden_key,
+                    "user_id": runner.user_id,
                     "latest": runner.latest,
                 })
             elif method == "GET" and path == "/api/frame":
                 # 最近一帧画面（持续录像帧或完整轮次帧），供主站实时画面拉取
                 body = _json_body(runner.latest_frame)
             elif method == "GET" and path == "/api/history":
-                body = _json_body({"items": db.agent_decision_history(runner.garden_key, limit=20)})
+                # 决策历史按账号过滤（query ?user_id=，默认游客 0）
+                uid = _uid(_query_params(scope).get("user_id"))
+                body = _json_body({"items": db.agent_decision_history(
+                    runner.garden_key, limit=20, user_id=uid)})
             elif method == "GET" and path == "/api/alerts/latest":
-                # 最近一条摄像头监测预警（内存优先，服务重启后回退查库）
+                # 最近一条摄像头监测预警（内存优先，服务重启后回退查库；按账号过滤）
+                uid = _uid(_query_params(scope).get("user_id"))
                 latest = self.alert_scheduler.latest()
-                if latest is None:
-                    latest = db.latest_camera_alert(runner.garden_key)
+                if latest is None or (uid and latest.get("data", {}).get("user_id") not in (None, uid)):
+                    latest = db.latest_camera_alert(runner.garden_key, user_id=uid)
                 body = _json_body({"ok": True, "alert": latest})
             elif method == "GET" and path == "/api/alerts/history":
+                uid = _uid(_query_params(scope).get("user_id"))
                 body = _json_body({"ok": True,
-                                   "items": db.camera_alert_history(runner.garden_key, limit=30)})
+                                   "items": db.camera_alert_history(runner.garden_key, limit=30, user_id=uid)})
             elif method == "POST" and path == "/api/agent/start":
-                # 支持可选 body: {"refresh_mode": "stream"|"interval", "interval": 秒}
-                runner.configure(refresh_mode=payload.get("refresh_mode"),
-                                 interval=payload.get("interval"))
-                body = _json_body({"ok": runner.start(), "running": runner.running,
-                                   "refresh_mode": runner.refresh_mode,
-                                   "interval": runner.interval})
+                # 支持 body: {"user_id": 账号(0=游客), "garden_key": 茶园, "refresh_mode": ..., "interval": ...}
+                uid = _uid(payload.get("user_id"))
+                if runner.running:
+                    body = _json_body({"ok": False,
+                                       "message": "Agent 正在运行（归属账号 user_id=%s），请先停止" % runner.user_id,
+                                       **runner.context()}, 409)
+                else:
+                    ctx = runner.set_context(uid, payload.get("garden_key"))
+                    if not ctx.get("ok"):
+                        body = _json_body({"ok": False, **ctx}, 400)
+                    else:
+                        # 摄像头源视图切换到该账号（游客=默认源；登录=其配置源）
+                        try:
+                            camera_manager.set_user(uid)
+                        except Exception:  # noqa: BLE001 - 摄像头层异常不影响 Agent 启动
+                            pass
+                        runner.configure(refresh_mode=payload.get("refresh_mode"),
+                                         interval=payload.get("interval"))
+                        started = runner.start()
+                        body = _json_body({"ok": started, "running": runner.running,
+                                           "user_id": runner.user_id,
+                                           "garden_key": runner.garden_key,
+                                           "refresh_mode": runner.refresh_mode,
+                                           "interval": runner.interval})
             elif method == "POST" and path == "/api/agent/config":
-                # 运行时修改刷新模式与间隔（不改变运行/停止状态）
-                cfg = runner.configure(refresh_mode=payload.get("refresh_mode"),
-                                       interval=payload.get("interval"))
-                body = _json_body({"ok": True, **cfg})
+                # 运行时修改刷新模式与间隔（不改变运行/停止状态；user_id 校验不越权切换账号）
+                uid = _uid(payload.get("user_id"))
+                if uid and runner.user_id and uid != runner.user_id and runner.running:
+                    body = _json_body({"ok": False, "message": "Agent 当前归属其他账号，不能修改"}, 403)
+                else:
+                    cfg = runner.configure(refresh_mode=payload.get("refresh_mode"),
+                                           interval=payload.get("interval"))
+                    body = _json_body({"ok": True, **cfg})
             elif method == "POST" and path == "/api/agent/stop":
                 body = _json_body({"ok": runner.stop(), "running": runner.running})
             elif method == "POST" and path == "/api/agent/step":
@@ -207,22 +256,47 @@ class TeaAgentASGI:
                 snapshot = await asyncio.to_thread(runner.step)
                 body = _json_body({"ok": True, "snapshot": snapshot})
             elif method == "GET" and path == "/api/cameras":
-                # 摄像头源列表（监控台管理）
-                body = _json_body({"ok": True, "cameras": camera_manager.list()})
+                # 摄像头源列表（按账号：?user_id=，游客 0 显示默认源）
+                uid = _uid(_query_params(scope).get("user_id"))
+                try:
+                    camera_manager.set_user(uid)
+                except Exception:  # noqa: BLE001
+                    pass
+                body = _json_body({"ok": True, "user_id": uid,
+                                   "cameras": camera_manager.list()})
             elif method == "POST" and path == "/api/cameras/add":
-                # 添加摄像头源：{"source": "usb:1" / "rtsp://…" / "http://…", "name": "可选"}
+                # 添加摄像头源：{"user_id": 账号, "source": "usb:1" / "rtsp://…" / "http://…", "name": "可选"}
+                uid = _uid(payload.get("user_id"))
+                try:
+                    camera_manager.set_user(uid, force=True)
+                except Exception:  # noqa: BLE001
+                    pass
                 cam = await asyncio.to_thread(camera_manager.add,
-                                              payload.get("source", ""), payload.get("name", ""))
+                                              payload.get("source", ""), payload.get("name", ""), uid)
                 if cam is None:
                     body = _json_body({"ok": False, "message": "无效的摄像头源，支持 usb:N / rtsp:// / http(s)://"}, 400)
                 else:
+                    # 重载视图使内存与数据库一致：有配置只显示配置源，无配置回退默认源
+                    try:
+                        camera_manager.set_user(uid, force=True)
+                    except Exception:  # noqa: BLE001
+                        pass
                     body = _json_body({"ok": True, "camera": cam})
             elif method == "POST" and path == "/api/cameras/remove":
-                # 删除摄像头源：{"cam_id": "cam2"}
-                removed = await asyncio.to_thread(camera_manager.remove, payload.get("cam_id", ""))
+                # 删除摄像头源：{"user_id": 账号, "cam_id": "cam2"}
+                uid = _uid(payload.get("user_id"))
+                try:
+                    camera_manager.set_user(uid, force=True)
+                except Exception:  # noqa: BLE001
+                    pass
+                removed = await asyncio.to_thread(camera_manager.remove, payload.get("cam_id", ""), uid)
                 if not removed:
                     body = _json_body({"ok": False, "message": "摄像头不存在"}, 404)
                 else:
+                    try:
+                        camera_manager.set_user(uid, force=True)
+                    except Exception:  # noqa: BLE001
+                        pass
                     body = _json_body({"ok": True})
             else:
                 status = 404
