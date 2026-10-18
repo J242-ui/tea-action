@@ -737,11 +737,18 @@ class CameraManager:
 
     # ---------- 采集 ----------
     def read_all(self) -> list[dict]:
-        """依次读取当前账号所有启用源的一帧（由 runner 调用，返回帧 + 来源标记）。"""
+        """依次读取当前账号所有启用源的一帧（由 runner 调用，返回帧 + 来源标记）。
+
+        先在锁内取「cam_id + 实例 + 元信息」快照，再在锁外逐个读帧：
+        set_user 切账号（clear/重建 _cams）与 read_all 并发时不会触发
+        RuntimeError: dictionary changed size during iteration。
+        """
         self._ensure_loaded()
+        with self._lock:
+            snapshot = [(cam_id, inst, meta) for cam_id, inst, meta in
+                        ((cid, self._cams[cid], self._meta.get(cid, {})) for cid in list(self._cams.keys()))]
         out = []
-        for cam_id, inst in list(self._cams.items()):
-            meta = self._meta.get(cam_id, {})
+        for cam_id, inst, meta in snapshot:
             try:
                 frame = inst.read_frame()
                 out.append({

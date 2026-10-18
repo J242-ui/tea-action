@@ -22,6 +22,7 @@ import json
 import os
 import time
 from pathlib import Path
+from urllib.parse import unquote
 
 from . import db
 from .agent.daily_alert import DailyAlertScheduler
@@ -34,13 +35,19 @@ WEB_INDEX = BASE_DIR / "web" / "index.html"
 SERVER_HOST = os.getenv("AGENT_WS_HOST", "127.0.0.1")
 SERVER_PORT = int(os.getenv("AGENT_WS_PORT", "8510"))
 
+# 首页文件内容缓存：避免每次 GET / 都重新读盘（约 33KB）
+try:
+    WEB_INDEX_BYTES = WEB_INDEX.read_bytes()
+except Exception:  # noqa: BLE001 - 文件缺失时回退空页，接口不受影响
+    WEB_INDEX_BYTES = b"<!doctype html><meta charset=utf-8><title>tea-agent-ws</title>"
+
 
 def _json_body(data: dict, status: int = 200) -> bytes:
     return json.dumps(data, ensure_ascii=False, default=str).encode("utf-8")
 
 
 def _query_params(scope) -> dict:
-    """解析 URL 查询参数（GET 请求的 user_id 等）。"""
+    """解析 URL 查询参数（GET 请求的 user_id 等），值做 URL 解码。"""
     qs = (scope.get("query_string") or b"").decode("utf-8")
     out: dict = {}
     for kv in qs.split("&"):
@@ -48,7 +55,7 @@ def _query_params(scope) -> dict:
             continue
         k, _, v = kv.partition("=")
         if k:
-            out[k] = v
+            out[unquote(k)] = unquote(v)
     return out
 
 
@@ -182,7 +189,7 @@ class TeaAgentASGI:
         try:
             if method == "GET" and path in ("/", "/index.html"):
                 ctype = "text/html; charset=utf-8"
-                body = WEB_INDEX.read_bytes()
+                body = WEB_INDEX_BYTES
             elif method == "GET" and path == "/api/health":
                 body = _json_body({"ok": True, "service": "tea-agent-ws"})
             elif method == "GET" and path == "/api/status":
@@ -201,19 +208,20 @@ class TeaAgentASGI:
             elif method == "GET" and path == "/api/history":
                 # 决策历史按账号过滤（query ?user_id=，默认游客 0）
                 uid = _uid(_query_params(scope).get("user_id"))
-                body = _json_body({"items": db.agent_decision_history(
-                    runner.garden_key, limit=20, user_id=uid)})
+                items = await asyncio.to_thread(
+                    db.agent_decision_history, runner.garden_key, 20, uid)
+                body = _json_body({"items": items})
             elif method == "GET" and path == "/api/alerts/latest":
                 # 最近一条摄像头监测预警（内存优先，服务重启后回退查库；按账号过滤）
                 uid = _uid(_query_params(scope).get("user_id"))
                 latest = self.alert_scheduler.latest()
                 if latest is None or (uid and latest.get("data", {}).get("user_id") not in (None, uid)):
-                    latest = db.latest_camera_alert(runner.garden_key, user_id=uid)
+                    latest = await asyncio.to_thread(db.latest_camera_alert, runner.garden_key, uid)
                 body = _json_body({"ok": True, "alert": latest})
             elif method == "GET" and path == "/api/alerts/history":
                 uid = _uid(_query_params(scope).get("user_id"))
-                body = _json_body({"ok": True,
-                                   "items": db.camera_alert_history(runner.garden_key, limit=30, user_id=uid)})
+                items = await asyncio.to_thread(db.camera_alert_history, runner.garden_key, 30, uid)
+                body = _json_body({"ok": True, "items": items})
             elif method == "POST" and path == "/api/agent/start":
                 # 支持 body: {"user_id": 账号(0=游客), "garden_key": 茶园, "refresh_mode": ..., "interval": ...}
                 uid = _uid(payload.get("user_id"))
@@ -222,13 +230,15 @@ class TeaAgentASGI:
                                        "message": "Agent 正在运行（归属账号 user_id=%s），请先停止" % runner.user_id,
                                        **runner.context()}, 409)
                 else:
-                    ctx = runner.set_context(uid, payload.get("garden_key"))
+                    # set_context 内含数据库查询（取账号茶园），camera_manager.set_user
+                    # 内含数据库查询（取账号摄像头源）——都放到线程池，避免阻塞事件循环
+                    ctx = await asyncio.to_thread(runner.set_context, uid, payload.get("garden_key"))
                     if not ctx.get("ok"):
                         body = _json_body({"ok": False, **ctx}, 400)
                     else:
                         # 摄像头源视图切换到该账号（游客=默认源；登录=其配置源）
                         try:
-                            camera_manager.set_user(uid)
+                            await asyncio.to_thread(camera_manager.set_user, uid)
                         except Exception:  # noqa: BLE001 - 摄像头层异常不影响 Agent 启动
                             pass
                         runner.configure(refresh_mode=payload.get("refresh_mode"),
@@ -259,16 +269,16 @@ class TeaAgentASGI:
                 # 摄像头源列表（按账号：?user_id=，游客 0 显示默认源）
                 uid = _uid(_query_params(scope).get("user_id"))
                 try:
-                    camera_manager.set_user(uid)
+                    await asyncio.to_thread(camera_manager.set_user, uid)
                 except Exception:  # noqa: BLE001
                     pass
-                body = _json_body({"ok": True, "user_id": uid,
-                                   "cameras": camera_manager.list()})
+                cams = await asyncio.to_thread(camera_manager.list)
+                body = _json_body({"ok": True, "user_id": uid, "cameras": cams})
             elif method == "POST" and path == "/api/cameras/add":
                 # 添加摄像头源：{"user_id": 账号, "source": "usb:1" / "rtsp://…" / "http://…", "name": "可选"}
                 uid = _uid(payload.get("user_id"))
                 try:
-                    camera_manager.set_user(uid, force=True)
+                    await asyncio.to_thread(camera_manager.set_user, uid, True)
                 except Exception:  # noqa: BLE001
                     pass
                 cam = await asyncio.to_thread(camera_manager.add,
@@ -278,7 +288,7 @@ class TeaAgentASGI:
                 else:
                     # 重载视图使内存与数据库一致：有配置只显示配置源，无配置回退默认源
                     try:
-                        camera_manager.set_user(uid, force=True)
+                        await asyncio.to_thread(camera_manager.set_user, uid, True)
                     except Exception:  # noqa: BLE001
                         pass
                     body = _json_body({"ok": True, "camera": cam})
@@ -286,7 +296,7 @@ class TeaAgentASGI:
                 # 删除摄像头源：{"user_id": 账号, "cam_id": "cam2"}
                 uid = _uid(payload.get("user_id"))
                 try:
-                    camera_manager.set_user(uid, force=True)
+                    await asyncio.to_thread(camera_manager.set_user, uid, True)
                 except Exception:  # noqa: BLE001
                     pass
                 removed = await asyncio.to_thread(camera_manager.remove, payload.get("cam_id", ""), uid)
@@ -294,7 +304,7 @@ class TeaAgentASGI:
                     body = _json_body({"ok": False, "message": "摄像头不存在"}, 404)
                 else:
                     try:
-                        camera_manager.set_user(uid, force=True)
+                        await asyncio.to_thread(camera_manager.set_user, uid, True)
                     except Exception:  # noqa: BLE001
                         pass
                     body = _json_body({"ok": True})

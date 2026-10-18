@@ -75,14 +75,12 @@ class AgentRunner:
                 return {"ok": False, "message": "Agent 正在运行，请先停止后再切换账号", **self.context()}
             uid = int(user_id or 0)
             if uid and uid != self.user_id:
-                # 登录账号：取该用户第一个茶园作为 Agent 服务茶园（无则保持默认演示茶园）
+                # 登录账号：取该用户第一个茶园作为 Agent 服务茶园（无则保持默认演示茶园）。
+                # key 与 8501 主站口径一致（rdb:{id}），避免类型/格式不一致导致茶园错位
                 try:
                     gardens = db.user_gardens(uid)
                     if gardens:
-                        self.garden_key = gardens[0]["id"] if "id" in gardens[0] else self.garden_key
-                        g = config.get_garden(self.garden_key)
-                        if g is None and "key" in gardens[0]:
-                            self.garden_key = gardens[0]["key"]
+                        self.garden_key = f"rdb:{gardens[0]['id']}"
                 except Exception:  # noqa: BLE001
                     pass
             if garden_key:
@@ -423,10 +421,11 @@ class AgentRunner:
 
     # ---------- 辅助 ----------
     def _garden(self) -> dict:
+        """当前茶园配置。用户自有茶园（rdb:{id} 或未知 key）不在内置配置时，
+        直接以 key 作为展示名，避免错误借用第一个演示园的天气/位置。"""
         g = config.get_garden(self.garden_key)
         if g is None:
-            gardens = config.load_gardens()
-            g = gardens[0] if gardens else {"id": self.garden_key, "name": self.garden_key}
+            return {"id": self.garden_key, "name": self.garden_key, "key": self.garden_key}
         return {**g, "key": self.garden_key}
 
     def _weather_and_risk(self, garden: dict) -> tuple[dict, dict]:
