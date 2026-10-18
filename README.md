@@ -368,9 +368,7 @@ C:\Users\Lenovo\anaconda3\python.exe -m streamlit run app.py
 - `location_id`：和风天气城市 LocationID（可通过 `WeatherClient.search_city("城市名")` 查询）
 - 未填写 `location_id` 时，使用 `lon,lat` 作为查询位置
 
-## 📚 项目说明文档
 
-完整的分模块说明（架构、决策规则、双大模型、数据库、训练、配置与运行）：见 **`项目学习文档.md`**。
 
 ## 📄 许可证
 
