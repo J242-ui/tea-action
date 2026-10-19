@@ -87,13 +87,45 @@ tea-garden-weather-service/
 
 ### 1. 环境准备
 
-需要 **Python 3.10+** 与 **MySQL 5.7+**（默认配置连接本机 root）。
+需要 **Python 3.10 / 3.11**（推荐；3.12+ 部分包可能缺少 wheel）与 **MySQL 5.7 / 8.0**（默认连接本机 root；不配置数据库也能以游客模式体验全部页面）。
+
+#### 完整依赖安装清单
+
+项目全部依赖（含用途）如下：
+
+| 依赖包 | 用途 | 说明 |
+| --- | --- | --- |
+| `torch`（CPU 版） | YOLO 模型训练/推理底层 | 必装，先装 CPU 版 |
+| `ultralytics` | YOLO 病害检测 | 必装 |
+| `opencv-python` | USB 摄像头采集与图像编码 | 必装 |
+| `streamlit` | 8501 气象主站 | 必装 |
+| `uvicorn` / `websockets` | 8510 WebSocket 服务与广播 | 必装 |
+| `numpy` | 数值与决策计算 | 必装 |
+| `pymysql` | MySQL 数据访问 | 必装 |
+| `python-dotenv` | `.env` 配置读取 | 必装 |
+| `requests` | 天气 / 大模型 API 调用 | 必装 |
+| `pandas` / `plotly` | 页面数据表格与图表 | 必装 |
+| `scikit-learn` / `lightgbm` / `statsforecast` / `joblib` | 风险预警三引擎（ML 分类 / 时序 / Bandit） | 必装 |
+| `pytest` | 单元测试 | 可选（测试用） |
+
+**安装命令（Windows / Linux 通用）：**
 
 ```bash
+# 1) 创建独立虚拟环境（推荐，避免污染系统 Python）
 python -m venv .venv
 # Windows: .venv\Scripts\activate   |   Linux/macOS: source .venv/bin/activate
+
+# 2) 先装 CPU 版 torch（避免 pip 默认拉 2GB+ 的 CUDA 包）
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+
+# 3) 安装其余全部依赖
 pip install -r requirements.txt
+pip install ultralytics opencv-python
 ```
+
+> **conda 可选**：依赖均为标准 PyPI 包，与 anaconda 无绑定关系——conda 只是环境管理工具，用 `venv + pip` 完全等价。
+> Windows 下如遇 `OMP: Error #15`，启动前设置 `$env:KMP_DUPLICATE_LIB_OK="TRUE"`（项目脚本内已自动处理）。
+> 装完可运行 `python smoke_test.py` 自检：18 项全 PASS（尤其 `runner: Agent 主循环单步`、`vision: 采集/检测`、`db: MySQL` 三项）即依赖到位。
 
 ### 2. 配置环境变量
 
@@ -324,26 +356,24 @@ REST API：`GET /api/status`、`GET /api/frame`（最近一帧画面）、`GET /
 - **未训练/未装依赖时自动降级**为模拟检测器（`backend=sim`），演示链路完整可用；模型就绪后 `backend=ultralytics` 无缝切换
 
 > ✅ **本机已训练完成**（2026-10）：`data/models/tea_yolo.pt`（快速档，23 轮，验证集 mAP50=0.818）。
-> 推理侧请用 **conda base 环境**（含 torch 2.14 + ultralytics + opencv，见下）；用项目 `.venv` 运行会因缺 torch 降级回模拟检测。
+> 推理环境需含 torch + ultralytics + opencv（conda 或 venv 皆可，见下「运行环境说明」）；缺少时自动降级为模拟检测。
 
-### 运行环境说明（重要）
+### 运行环境说明
 
-真实模型推理需要 torch + ultralytics + opencv，当前已安装在 **conda base 环境**：
+真实模型推理需要 torch + ultralytics + opencv，可用 **conda 环境** 或 **venv 环境**（二选一，依赖等价，见上文「完整依赖安装清单」）：
 
 ```bash
-# 训练（已产出 tea_yolo.pt，可按需重训 --full 档）
-C:\Users\Lenovo\anaconda3\python.exe training\train_yolo.py --full
+# 方式一：conda 环境（本项目开发机使用）
+C:\Users\Lenovo\anaconda3\python.exe training\train_yolo.py --full     # 训练（可选重训）
+C:\Users\Lenovo\anaconda3\python.exe -m src.ws_server                  # 启动 8510 动态展示
+C:\Users\Lenovo\anaconda3\python.exe -m streamlit run app.py           # 启动 8501 主站
 
-# 启动动态展示服务（用 base 环境，才能加载真实模型）
-C:\Users\Lenovo\anaconda3\python.exe -m src.ws_server
-
-# 启动 Streamlit 主站（同样用 base 环境）
-C:\Users\Lenovo\anaconda3\python.exe -m streamlit run app.py
+# 方式二：venv 环境（已按上文清单装齐 torch CPU + ultralytics + opencv 后）
+python -m src.ws_server
+python -m streamlit run app.py
 ```
 
-若改用项目 `.venv` 运行且希望真实推理，需在 venv 内补装：
-`pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu && pip install ultralytics opencv-python`
-（Windows 下如遇 `OMP: Error #15`，在启动前设 `$env:KMP_DUPLICATE_LIB_OK="TRUE"`，脚本内已自动设置。）
+> 若环境缺少 torch/ultralytics/opencv，YOLO 检测自动降级为模拟检测器（演示链路仍完整可用），画面角标会显示「演示帧（摄像头不可用）」。
 
 ### 新增数据表（自动建表）
 
