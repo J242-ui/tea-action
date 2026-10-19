@@ -95,7 +95,7 @@ tea-garden-weather-service/
 
 | 依赖包 | 用途 | 说明 |
 | --- | --- | --- |
-| `torch`（CPU 版） | YOLO 模型训练/推理底层 | 必装，先装 CPU 版 |
+| `torch`（CPU 版） | YOLO 模型训练/推理底层 | 必装，先装 CPU 版，如果电脑有RTX3050及以上的显卡，推荐GPU版，可以大大提高训练和推理速度 |
 | `ultralytics` | YOLO 病害检测 | 必装 |
 | `opencv-python` | USB 摄像头采集与图像编码 | 必装 |
 | `streamlit` | 8501 气象主站 | 必装 |
@@ -106,7 +106,7 @@ tea-garden-weather-service/
 | `requests` | 天气 / 大模型 API 调用 | 必装 |
 | `pandas` / `plotly` | 页面数据表格与图表 | 必装 |
 | `scikit-learn` / `lightgbm` / `statsforecast` / `joblib` | 风险预警三引擎（ML 分类 / 时序 / Bandit） | 必装 |
-| `pytest` | 单元测试 | 可选（测试用） |
+| `pytest` | 单元测试 | 可以安装（测试用） |
 
 **安装命令（Windows / Linux 通用）：**
 
@@ -115,7 +115,7 @@ tea-garden-weather-service/
 python -m venv .venv
 # Windows: .venv\Scripts\activate   |   Linux/macOS: source .venv/bin/activate
 
-# 2) 先装 CPU 版 torch（避免 pip 默认拉 2GB+ 的 CUDA 包）
+# 2) 轻薄本运行时先装 CPU 版 torch（避免 pip 默认拉 2GB+ 的 CUDA 包，如果电脑有RTX3050及以上显卡的情况下，推荐安装GUP版，这样yolo模型训练和推理速度将会大幅提升）
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
 
 # 3) 安装其余全部依赖
@@ -413,7 +413,7 @@ python -m streamlit run app.py
 
 ## 📚 项目说明文档
 
-完整的项目说明（整体架构、决策规则、双大模型分工、数据库设计、模型训练、配置与运行、各模块职责）：见 **`项目学习文档.md`**，逐文件解释每个模块的作用与调用关系，适合作为二次开发与部署的参考。
+这里有完整的项目说明（整体架构、决策规则、双大模型分工、数据库设计、模型训练、配置与运行、各模块职责）：见 **`项目学习文档.md`**，逐文件解释每个模块的作用与调用关系，适合作为二次开发与部署的参考。
 
 ## 📄 许可证
 
