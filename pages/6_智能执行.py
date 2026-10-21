@@ -134,7 +134,7 @@ def main() -> None:
     uid = current_uid()
     user = st.session_state.get("user")
     who = f"账号：{user.get('nickname') or user.get('username')}（#{uid}）" if user else "游客（演示数据）"
-    st.caption(f"当前身份：{who} ｜ 摄像头源与历史数据均按此账号隔离")
+    st.caption(f"当前身份：{who} ")
 
     # ---------- 顶部控制区 ----------
     c1, c2, c3 = st.columns([2, 2, 2])
@@ -171,7 +171,7 @@ def main() -> None:
     st.divider()
     st.markdown("### 📹 摄像头源管理")
     st.caption("摄像头源与当前账号绑定（游客为系统默认源）。登录后可添加网络摄像头（RTSP/HTTP），"
-               "多路画面在动态监控台网页实时显示；历史数据同样按账号隔离。")
+               "多路画面在动态监控台网页实时显示")
     cams = _api("/api/cameras", params={"user_id": uid}).get("cameras", [])
     if cams:
         rows = [{
@@ -351,7 +351,7 @@ def _render_history(garden: dict, uid: int = 0) -> None:
     """WS 服务不可用时，直接读库展示当前账号的历史决策。"""
     rows = db.agent_decision_history(garden["key"], limit=10, user_id=uid)
     if rows:
-        st.subheader("📜 Agent 决策历史（数据库）")
+        st.subheader("📜 Agent 决策历史")
         df = pd.DataFrame([{
             "时间": _fmt_time(r.get("created_at")),
             "决策": DECISION_CN.get(r.get("decision_type"), r.get("decision_type")),

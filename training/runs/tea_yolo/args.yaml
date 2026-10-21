@@ -1,7 +1,7 @@
 task: detect
 mode: train
 model: yolov8n.pt
-data: C:\Users\Lenovo\Desktop\项目文件\training\datasets\tea_leaf_disease_quick\data.yaml
+data: C:\Users\Lenovo\Desktop\茶园2026.10.19\training\datasets\tea_leaf_disease_quick\data.yaml
 epochs: 25
 time: null
 patience: 10
@@ -12,14 +12,14 @@ save_period: -1
 cache: false
 device: cpu
 workers: 2
-project: C:\Users\Lenovo\Desktop\项目文件\training\runs
+project: C:\Users\Lenovo\Desktop\茶园2026.10.19\training\runs
 name: tea_yolo
 exist_ok: true
 pretrained: true
 cls_remap: true
 optimizer: auto
 verbose: true
-seed: 0
+seed: 42
 deterministic: true
 single_cls: false
 rect: false
@@ -111,4 +111,4 @@ auto_augment: randaugment
 erasing: 0.4
 cfg: null
 tracker: tracktrack.yaml
-save_dir: C:\Users\Lenovo\Desktop\项目文件\training\runs\tea_yolo
+save_dir: C:\Users\Lenovo\Desktop\茶园2026.10.19\training\runs\tea_yolo
